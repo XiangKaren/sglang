@@ -112,6 +112,7 @@ LOAD_FORMAT_CHOICES = [
     "bitsandbytes",
     "mistral",
     "layered",
+    "layered_fp8",
     "flash_rl",
     "remote",
     "remote_instance",
