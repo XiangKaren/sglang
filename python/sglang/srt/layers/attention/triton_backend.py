@@ -2006,8 +2006,21 @@ class TritonAttnBackend(AttentionBackend):
             )
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+        # ESIMD decode kernel hard cap: MAX_SPLITS=256 * SPLIT_TILE=64 = 16384
+        # tokens of KV per sequence. Longer sequences would overrun the phase-1
+        # scratch and trip the kernel's n_splits assertion, so fall through to
+        # the triton decode path for them. seq_lens_sum is a host-side int
+        # (no device sync) and, for a single decode sequence, equals its KV
+        # length; for a batch it is the sum, which is a safe (conservative)
+        # over-estimate — never lets an over-length sequence reach the kernel.
+        _ESIMD_DECODE_MAX_SEQ = 16384
+        _esimd_seq_ok = (
+            getattr(forward_batch, "seq_lens_sum", None) is None
+            or forward_batch.seq_lens_sum <= _ESIMD_DECODE_MAX_SEQ
+        )
         if (
             _XPU_ESIMD_DECODE_FN is not None
+            and _esimd_seq_ok
             and not self.use_mla
             and layer.qk_head_dim == 256
             and layer.qk_head_dim == layer.v_head_dim
