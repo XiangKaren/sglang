@@ -3499,6 +3499,15 @@ class Scheduler(
             # A beam candidate owns beam_width rows once decoding.
             res = min(res, available // beam_width)
 
+        # Hybrid GDN/Mamba models keep a SEPARATE mamba state pool that is
+        # typically much smaller than the req-slot pool (especially with
+        # --max-mamba-cache-size or a low mem-fraction). Admission must also be
+        # bounded by mamba availability; otherwise a multi-seq prefill batch is
+        # admitted past the mamba pool size and HybridReqToTokenPool.alloc
+        # over-indexes the size-N mamba pool -> GPU index OOB -> SIGABRT.
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is not None:
+            res = min(res, mamba_allocator.available_size())
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:

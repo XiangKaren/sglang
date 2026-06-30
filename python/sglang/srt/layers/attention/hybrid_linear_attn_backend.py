@@ -609,7 +609,14 @@ class MambaAttnBackendBase(AttentionBackend):
             # Translate using the LIVE v2p table BEFORE the padding sentinel below;
             # captured Mamba kernels read state_indices_list as PHYSICAL ids.
             mamba_indices = self._translate_mamba_indices(mamba_indices)
-            mamba_indices[bs - num_padding :] = -1
+            # Padding reqs point at reserved physical mamba slot 0 (a dummy write
+            # target; MambaSlotAllocator hands real reqs slots >= 1). The triton GDN
+            # kernels treat -1 as a skip sentinel, but the XPU ESIMD GDN kernels
+            # (gdn_conv_fused_seq etc.) index the state pool with no negative guard,
+            # so -1 -> state[-1] -> GPU index OOB -> SIGABRT on every batch>1 graph
+            # replay. Slot 0 is valid/harmless for both paths (padding out discarded).
+            # (cherry-pick 0ea27a51 grafted onto HEAD's translate+validate structure.)
+            mamba_indices[bs - num_padding :] = 0
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if _validate_mamba_replay_state_indices and not in_capture:
             # This pre-replay diagnostic intentionally syncs to reject malformed
@@ -620,7 +627,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 valid_bs=valid_bs,
                 total_bs=bs,
                 num_state_slots=self.req_to_token_pool.mamba_pool.size + 1,
-                pad_slot_id=self.pad_slot_id,
+                pad_slot_id=0,  # padded rows now carry dummy slot 0, not -1
             )
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
