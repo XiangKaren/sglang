@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+import os
 import re
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -24,15 +25,17 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
     gemma_routing_post_topk,
-)
-from sglang.srt.distributed import (
-    get_pp_group,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -58,10 +61,25 @@ from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbed
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
+
+# Lazy-loaded ESIMD kernels (fp16 decode fast paths).
+_esimd_qkv_split_norm_rope = None
+_esimd_fused_add_rms_norm = None
+_esimd_rmsnorm_residual_scalar = None
+_esimd_norm_add_norm = None
+try:
+    from custom_esimd_kernels_sglang import (
+        esimd_qkv_split_norm_rope as _esimd_qkv_split_norm_rope,
+        esimd_fused_add_rms_norm as _esimd_fused_add_rms_norm,
+        esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
+        esimd_norm_add_norm as _esimd_norm_add_norm,
+    )
+except ImportError:
+    pass
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -72,21 +90,6 @@ def get_attention_sliding_window_size(config):
 
 Gemma4MLP = Gemma3MLP
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
-
-
-def load_tied_lm_head(
-    loaded_weight, *, params_dict, loaded_params, head_param_name="lm_head.weight"
-):
-    """Load a tied embedding into an lm_head the runtime could not alias.
-
-    No-op when this rank holds no lm_head.
-    """
-    head_param = params_dict.get(head_param_name)
-    if head_param is None:
-        return
-    wl = getattr(head_param, "weight_loader", default_weight_loader)
-    wl(head_param, loaded_weight)
-    loaded_params.add(head_param_name)
 
 
 def pp_filter_load_weight(
@@ -124,12 +127,11 @@ def pp_filter_load_weight(
         return True
 
     if tie_word_embeddings and pp_group.is_last_rank and name == embed_weight_name:
-        load_tied_lm_head(
-            loaded_weight,
-            params_dict=params_dict,
-            loaded_params=loaded_params,
-            head_param_name=head_param_name,
-        )
+        head_param = params_dict.get(head_param_name)
+        if head_param is not None:
+            wl = getattr(head_param, "weight_loader", default_weight_loader)
+            wl(head_param, loaded_weight)
+            loaded_params.add(head_param_name)
         return True
 
     if not pp_group.is_first_rank and any(p in name for p in first_rank_only_patterns):
@@ -224,7 +226,7 @@ class Gemma4MoE(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.num_experts = config.num_experts
-        self.tp_size = get_parallel().tp_size
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         # Per-expert output scale folded into routing weights so that
         # MoE's fused kernel computes: Σ_e (expert_e * w_e * scale_e)
@@ -270,7 +272,8 @@ class Gemma4MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
 
         self.experts = experts_type(
-            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
+            num_experts=config.num_experts
+            + get_global_server_args().ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=layer_id,
@@ -304,27 +307,23 @@ class Gemma4Attention(nn.Module):
 
         self.layer_id = layer_id
         self.config = config
-        tp_size = get_parallel().tp_size
+        tp_size = get_tensor_model_parallel_world_size()
 
         layer_type = config.layer_types[layer_id]
         self.sliding_window = (
-            get_attention_sliding_window_size(config)
-            if layer_type == "sliding_attention"
-            else -1
+            config.sliding_window if layer_type == "sliding_attention" else None
         )
 
+        self.total_num_heads = config.num_attention_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+
         if layer_type == "sliding_attention":
-            self.total_num_heads = getattr(
-                config, "swa_num_attention_heads", config.num_attention_heads
-            )
             self.total_num_kv_heads = getattr(
                 config, "swa_num_key_value_heads", config.num_key_value_heads
             )
         else:
-            self.total_num_heads = config.num_attention_heads
             self.total_num_kv_heads = config.num_key_value_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
 
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
@@ -421,6 +420,20 @@ class Gemma4Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def _init_esimd_qkv_cache(self):
+        """Lazily build precomputed buffers for the ESIMD QKV+norm+rope kernel."""
+        if hasattr(self, "_esimd_qkv_cache"):
+            return self._esimd_qkv_cache
+        dev = self.q_norm.weight.device
+        dtype = torch.float16
+        cache = {
+            "wq": (self.q_norm.weight.data.to(dtype) - 1.0).contiguous(),
+            "wk": (self.k_norm.weight.data.to(dtype) - 1.0).contiguous(),
+            "gate": torch.empty((1, self.q_size), dtype=dtype, device=dev),
+        }
+        self._esimd_qkv_cache = cache
+        return cache
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -429,6 +442,65 @@ class Gemma4Attention(nn.Module):
         **kwargs,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
+
+        # ESIMD fast path: fused QKV split + Q/K RMSNorm + RoPE in one kernel.
+        # Eligible when: head_dim==256, fp16, non-kv-shared, decode (M small).
+        is_kv_shared = (
+            self.is_kv_shared_layer and self.kv_shared_layer_index is not None
+        )
+        _use_esimd_qkv = (
+            _esimd_qkv_split_norm_rope is not None
+            and self.head_dim == 256
+            and qkv.dtype == torch.float16
+            and not is_kv_shared
+            and qkv.is_contiguous()
+            and os.environ.get("SGLANG_DISABLE_ESIMD_QKV", "0") != "1"
+        )
+        if _use_esimd_qkv:
+            cache = self._init_esimd_qkv_cache()
+            n_tok = qkv.shape[0]
+            dev = qkv.device
+            q = torch.empty(n_tok, self.q_size, dtype=torch.float16, device=dev)
+            k = torch.empty(n_tok, self.kv_size, dtype=torch.float16, device=dev)
+            v = torch.empty(n_tok, self.kv_size, dtype=torch.float16, device=dev)
+            self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            cs_cache = self.rotary_emb.cos_sin_cache
+            rotary_dim = cs_cache.shape[-1]  # already = head_dim for sliding
+            # positions.to(int32) is identical across all decoder layers in a
+            # step; cache it on forward_batch (shared per step, fresh each step)
+            # to drop ~1 redundant cast kernel per layer.
+            pos_i32 = getattr(forward_batch, "_gemma4_positions_i32", None)
+            if (
+                pos_i32 is None
+                or getattr(forward_batch, "_gemma4_positions_src", None) is not positions
+            ):
+                pos_i32 = positions.to(torch.int32)
+                forward_batch._gemma4_positions_i32 = pos_i32
+                forward_batch._gemma4_positions_src = positions
+            _esimd_qkv_split_norm_rope(
+                qkv, q, cache["gate"], k, v,
+                cache["wq"], cache["wk"],
+                pos_i32,
+                self.num_heads, self.num_kv_heads,
+                False,  # attn_output_gate
+                rotary_dim,
+                cs_cache,
+            )
+            # V norm is now fused into the ESIMD kernel (V branch does RMSNorm,
+            # with_scale=False → pure norm, no weight multiply). No separate call.
+            v_3d = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            # Reshape for attention: q [n_tok, num_heads, head_dim], k/v [n_tok, kv_heads, head_dim]
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v = v_3d
+            attn_output = self.attn(
+                q, k, v, forward_batch=forward_batch, save_kv_cache=True,
+            )
+            if attn_output.dim() == 3:
+                attn_output = attn_output.flatten(-2, -1)
+            output, _ = self.o_proj(attn_output)
+            return output
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
@@ -441,9 +513,11 @@ class Gemma4Attention(nn.Module):
         )
         can_fuse_qkv_norm = (
             (q.is_cuda or q.is_xpu)
+            and self.head_dim == 256
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
+            and os.environ.get("SGLANG_GEMMA4_DISABLE_FUSED_QKV_NORM", "0") != "1"
         )
         if can_fuse_qkv_norm:
             if is_kv_shared:
@@ -682,9 +756,10 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.enable_moe_block:
+            # MoE path keeps the standalone post-attention norm.
+            hidden_states = self.post_attention_layernorm(hidden_states)
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
             # Also need raw (unfused) residual for router and pre_ff_norm_2
             hidden_states, residual = self.pre_feedforward_layernorm(
@@ -731,10 +806,53 @@ class Gemma4DecoderLayer(nn.Module):
             # Combine branches
             hidden_states = hidden_states_1 + hidden_states_2
         else:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
-            )
+            # Dense path. Fuse the standalone post_attention_layernorm, the
+            # residual add, and pre_feedforward_layernorm into ONE kernel:
+            #   residual = post_attn_norm(attn_out) + residual
+            #   hidden   = pre_ff_norm(residual)
+            # (RMSNorm here uses raw weight, so pass weights as-is; `out` may
+            #  safely alias `attn_out` since the kernel reads it before writing.)
+            if (
+                _esimd_norm_add_norm is not None
+                and hidden_states.shape[0] == 1
+                and hidden_states.dtype == torch.float16
+                and hidden_states.is_contiguous()
+                and residual.is_contiguous()
+            ):
+                if not hasattr(self, "_nan_w1"):
+                    self._nan_w1 = (
+                        self.post_attention_layernorm.weight.data.to(torch.float16).contiguous()
+                    )
+                    self._nan_w2 = (
+                        self.pre_feedforward_layernorm.weight.data.to(torch.float16).contiguous()
+                    )
+                _esimd_norm_add_norm(
+                    hidden_states,
+                    residual,
+                    self._nan_w1,
+                    self._nan_w2,
+                    hidden_states,
+                    self.post_attention_layernorm.variance_epsilon,
+                    self.pre_feedforward_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+                if (
+                    _esimd_fused_add_rms_norm is not None
+                    and hidden_states.shape[0] == 1
+                    and hidden_states.dtype == torch.float16
+                    and hidden_states.is_contiguous()
+                    and residual.is_contiguous()
+                ):
+                    norm = self.pre_feedforward_layernorm
+                    if not hasattr(norm, "_esimd_w"):
+                        norm._esimd_w = norm.weight.data.to(torch.float16).contiguous()
+                    _esimd_fused_add_rms_norm(hidden_states, residual, norm._esimd_w, norm.variance_epsilon)
+                else:
+                    hidden_states, residual = self.pre_feedforward_layernorm(
+                        hidden_states, residual
+                    )
             hidden_states = self.mlp(hidden_states)
 
         if (
@@ -743,15 +861,32 @@ class Gemma4DecoderLayer(nn.Module):
             and (hidden_states.is_cuda or hidden_states.is_xpu)
             and hidden_states.dim() == 2
         ):
-            # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
             norm = self.post_feedforward_layernorm
-            hidden_states = gemma_rmsnorm_residual_scalar(
-                hidden_states,
-                norm.weight.data,
-                residual,
-                self.layer_scalar,
-                norm.variance_epsilon,
-            )
+            if (
+                _esimd_rmsnorm_residual_scalar is not None
+                and hidden_states.shape[0] == 1
+                and hidden_states.dtype == torch.float16
+                and hidden_states.is_contiguous()
+                and residual.is_contiguous()
+            ):
+                if not hasattr(norm, "_esimd_w"):
+                    norm._esimd_w = (norm.weight.data.to(torch.float16) - 1.0).contiguous()
+                if not hasattr(self, "_rrs_scalar"):
+                    self._rrs_scalar = float(self.layer_scalar.item())
+                if not hasattr(self, "_rrs_buf"):
+                    self._rrs_buf = torch.empty_like(hidden_states)
+                hidden_states = _esimd_rmsnorm_residual_scalar(
+                    hidden_states, norm._esimd_w, residual, self._rrs_buf,
+                    norm.variance_epsilon, self._rrs_scalar,
+                )
+            else:
+                hidden_states = gemma_rmsnorm_residual_scalar(
+                    hidden_states,
+                    norm.weight.data,
+                    residual,
+                    self.layer_scalar,
+                    norm.variance_epsilon,
+                )
         else:
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = hidden_states + residual
@@ -805,8 +940,8 @@ class Gemma4TextModel(PreTrainedModel):
         # combination until the runner becomes schema-aware; users can run
         # PP + PLE eagerly with --disable-cuda-graph.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
-            sa = get_server_args()
-            if sa is not None and not get_exec().graph.disable_cuda_graph:
+            sa = get_global_server_args()
+            if sa is not None and not sa.disable_cuda_graph:
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "
                     "per-layer-input (PLE) embeddings under CUDA graph: "
@@ -1142,14 +1277,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
-        if layer_ids is None:
-            raise ValueError(
-                "DFLASH requires explicit layer_ids for aux hidden capture."
-            )
-        self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
-
     @torch.no_grad()
     def forward(
         self,
@@ -1394,10 +1521,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
         VocabParallelEmbedding (sharded). This method extracts the correct
         shard so the weights can be shared.
         """
-        tp_size = get_parallel().tp_size
+        tp_size = get_tensor_model_parallel_world_size()
         if tp_size <= 1:
             return weight
-        tp_rank = get_parallel().tp_rank
+        tp_rank = get_tensor_model_parallel_rank()
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 
