@@ -1,29 +1,9 @@
 from __future__ import annotations
 
 import os
-
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
-# Split-K decode: number of KV splits for the hd512 (gemma4 global) ESIMD kernel.
-# The kernel now derives its per-split chunk from the REAL seqlen (seqLens[b]) —
-# see splitk_decode.h — so a single high G is optimal across ALL context lengths
-# (idle splits early-return; each active split scans ceil(seqlen/G) tokens). G=64
-# = 16 q-heads * 64 = 1024 work-items ≈ BMG's ~960 HW-thread ceiling; measured
-# near-flat TPOT to 64k (44ms@32k, 50ms@64k) vs G=4/16 which grow with ctx.
-# Overridable via env for A/B.
-_SPLITK_G = int(os.environ.get("SGLANG_SPLITK_G", "64"))
-
-# Debug gate: force the ESIMD decode fast paths (page_attn_decode + split-K) OFF
-# so decode routes through flash_attn_with_kvcache (the fp16->bf16-casting wrapper).
-# Used to localize the fp16+graph decode garble.
-_DISABLE_ESIMD_DECODE = os.environ.get("SGLANG_DISABLE_ESIMD_DECODE", "0") == "1"
-
-# Debug gate: force the hd256 page_attn_decode path OFF so sliding layers also use
-# split-K (which accepts head_dim 256). Both are no-SLM/graph-capturable. Isolates
-# whether the graph garble is in page_attn_decode vs split-K.
-_DISABLE_PAGE_ATTN = os.environ.get("SGLANG_DISABLE_PAGE_ATTN", "0") == "1"
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -41,16 +21,72 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from custom_esimd_kernels_sglang import eagle_page_attn_decode
 from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size, merge_state_v2
+
+# Proven-correct flat-NHD ESIMD decode kernel (token-granular kv_indptr/kv_indices),
+# same op the triton backend's XPU ESIMD fast path uses. On this stack the paged
+# eagle_page_attn_decode kernel is numerically wrong for GQA ratio=8 / single KV
+# head, so the XPU graph decode path routes here instead. Gated by
+# SGL_XPU_DECODE_SGLANG_ATTN (default on); falls back to eagle when unavailable.
+_sglang_decode_attn_fn = None
+try:
+    from custom_esimd_kernels_sglang import sglang_decode_attn as _sglang_decode_attn_fn
+except Exception:
+    _sglang_decode_attn_fn = None
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-_esimd_page_attn_decode = None
-_splitk_decode_attention = None
+# PTL-proven fp16 prefill SDPA DPAS kernel (custom_esimd_kernels_sglang, HD=256).
+# Replaces the cutlass-sycl flash fp16 prefill (which NaNs on Xe / produces
+# garbage prefill logits) for head_dim==256 fp16. Lazily resolved; gated by
+# SGL_XPU_PREFILL_DPAS=1. Op namespace is custom_esimd_kernels_vllm (unchanged
+# from the ported kernel). Falls through to flash_attn_with_kvcache when the op
+# is unavailable / ineligible.
+_prefill_dpas_op = None
+_prefill_dpas_tried = False
+
+
+def _get_prefill_dpas_op():
+    global _prefill_dpas_op, _prefill_dpas_tried
+    if not _prefill_dpas_tried:
+        _prefill_dpas_tried = True
+        try:
+            import custom_esimd_kernels_sglang.custom_esimd_kernels_prefill_dpas  # noqa: F401 — registers the op
+            _prefill_dpas_op = torch.ops.custom_esimd_kernels_vllm.esimd_sdpa_prefill_dpas
+        except Exception:
+            _prefill_dpas_op = None
+    return _prefill_dpas_op
+
 try:
-    from custom_esimd_kernels_sglang import eagle_page_attn_decode as _esimd_page_attn_decode
-    from custom_esimd_kernels_sglang import splitk_decode_attention as _splitk_decode_attention
+    from custom_esimd_kernels_sglang import eagle_page_attn_decode_temp_size
 except ImportError:
-    pass
+    # Backward-compatible fallback for older custom_esimd_kernels_sglang builds
+    # that export eagle_page_attn_decode but not *_temp_size.
+    def eagle_page_attn_decode_temp_size(
+        batches: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        max_seq_len: int,
+    ) -> int:
+        hidden_dim_p = ((max_seq_len + 63) // 64) * 64
+        hidden_dim_p_max = (max_seq_len + 63) // 64
+        reduce_count = (max_seq_len + 1023) // 1024
+        gqa_ratio = num_q_heads // num_kv_heads
+        sz_p = batches * num_q_heads * hidden_dim_p
+        sz_group_max = batches * num_q_heads * hidden_dim_p_max
+        sz_global_max = batches * gqa_ratio * num_kv_heads
+        sz_global_poll_p = batches * gqa_ratio * num_kv_heads
+        sz_out_temp = batches * reduce_count * head_dim * num_q_heads
+        sz_global_softmax_sum = batches * reduce_count * num_q_heads
+        return (
+            sz_p
+            + sz_group_max
+            + sz_global_max
+            + sz_global_poll_p
+            + sz_out_temp
+            + sz_global_softmax_sum
+        )
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -59,7 +95,8 @@ class XPUAttentionBackend(AttentionBackend):
     TODO:
     - Prefill and Decode disaggregation, currently only chunked prefill is supported
     - Speculative Decoding support
-    - XPU Graph support, see https://github.com/pytorch/pytorch/issues/162143
+    - XPU Graph capture/replay for decode paths is supported; extend paths
+      still use the eager fallback.
     - MLA Prefill support
     """
 
@@ -100,6 +137,15 @@ class XPUAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.head_dim = getattr(model_runner.model_config.hf_text_config, "head_dim", None)
+        if self.head_dim is None:
+            self.head_dim = (
+                model_runner.model_config.hf_text_config.hidden_size // self.num_attention_heads
+            )
+        total_kv_heads = getattr(
+            model_runner.model_config.hf_text_config, "num_key_value_heads", self.num_local_heads
+        )
+        self.num_local_kv_heads = max(1, total_kv_heads // self.tp_size)
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         self.use_sliding_window_kv_pool = (
@@ -132,100 +178,150 @@ class XPUAttentionBackend(AttentionBackend):
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
+        # XPU graph capture/replay state. Populated by init_cuda_graph_state.
+        self._graph_state: dict = {}
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        """Pre-allocate stable device buffers for XPU graph capture + replay."""
+        """Pre-allocate stable device buffers for XPU graph capture/replay."""
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         device = self.device
 
+        # sglang_decode_attn (flat-NHD, token-granular) scratch sizing.
+        # temp_p = batches*Hq*n_splits*(1 + 1 + 256); n_splits capped at 256.
+        _SPLIT_TILE = 64
+        _MAX_N_SPLITS = 256
+        self._sglang_decode_graph_max_seq = _SPLIT_TILE * _MAX_N_SPLITS  # 16384
+        _sglang_temp_numel = (
+            max_bs * self.num_local_heads * _MAX_N_SPLITS * (1 + 1 + 256)
+        )
+
         self._graph_state = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=device),
-            "cu_seqlens_q": torch.arange(0, max_bs + 1, dtype=torch.int32, device=device),
-            "page_table": torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=device),
-            "strided_indices": torch.arange(0, self.max_context_len, self.page_size, device=device),
+            "cu_seqlens_q_decode": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=device
+            ),
+            "cu_seqlens_k": torch.zeros(max_bs + 1, dtype=torch.int32, device=device),
+            "page_table": torch.zeros(
+                max_bs, max_num_pages, dtype=torch.int32, device=device
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=device
+            ),
+            "temp_p": torch.empty(
+                eagle_page_attn_decode_temp_size(
+                    max_bs,
+                    self.num_local_heads,
+                    self.num_local_kv_heads,
+                    self.head_dim,
+                    self.max_context_len,
+                ),
+                dtype=torch.float32,
+                device=device,
+            ),
+            # Token-granular KV index buffers for sglang_decode_attn. Stable
+            # data_ptr across graph replays; filled each step in the replay hook.
+            "kv_indptr": torch.zeros(max_bs + 1, dtype=torch.int32, device=device),
+            "kv_indices": torch.zeros(
+                max_bs * self.max_context_len, dtype=torch.int32, device=device
+            ),
+            "sglang_temp_p": torch.empty(
+                _sglang_temp_numel, dtype=torch.float32, device=device
+            ),
+            "captured": {},
         }
-        if self.use_sliding_window_kv_pool:
-            self._graph_state["swa_page_table"] = torch.zeros(
-                max_bs, max_num_pages, dtype=torch.int32, device=device,
-            )
-            # SWA-pool KV write location (one slot per request per decode step).
-            # Must be address-stable for graph capture/replay (the captured
-            # set_kv_buffer writes to its capture-time address).
-            self._graph_state["swa_out_cache_loc"] = torch.zeros(
-                max_bs, dtype=torch.int64, device=device,
-            )
 
-    def init_forward_metadata_out_graph(self, forward_batch: ForwardBatch, in_capture: bool = False):
-        """Prepare forward_metadata for graph capture or replay (runs outside graph.capture())."""
-        if not forward_batch.forward_mode.is_decode_or_idle():
-            return
-        if not hasattr(self, "_graph_state") or not self._graph_state:
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        """Prepare forward metadata outside the graph capture region."""
+        if not self._graph_state or not forward_batch.forward_mode.is_decode_or_idle():
+            self.init_forward_metadata(forward_batch)
             return
 
         bs = forward_batch.batch_size
-        state = self._graph_state
         seq_lens = forward_batch.seq_lens[:bs]
+        seq_lens_cpu = (
+            forward_batch.seq_lens_cpu[:bs]
+            if forward_batch.seq_lens_cpu is not None
+            else None
+        )
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
 
+        state = self._graph_state
         metadata = FlashAttentionMetadata()
         metadata.cache_seqlens_int32 = state["cache_seqlens"][:bs]
-        metadata.cu_seqlens_q = state["cu_seqlens_q"][:bs + 1]
+        metadata.cu_seqlens_q = state["cu_seqlens_q_decode"][: bs + 1]
+        metadata.cu_seqlens_k = state["cu_seqlens_k"][: bs + 1]
         metadata.page_table = state["page_table"][:bs, :]
         metadata.max_seq_len_q = 1
 
-        # Populate cache_seqlens from real seq_lens
         metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
-        max_len = int(seq_lens.max().item()) if seq_lens.numel() else 1
-        metadata.max_seq_len_k = max_len
+        torch.cumsum(
+            metadata.cache_seqlens_int32,
+            dim=0,
+            dtype=torch.int32,
+            out=metadata.cu_seqlens_k[1:],
+        )
 
-        # Populate page_table. NOTE on ordering (must match eager
-        # init_forward_metadata): the SWA translation
-        # (translate_loc_from_full_to_swa) maps full-pool KV *slot* indices ->
-        # SWA-pool slot indices, so it MUST be applied to the RAW req_to_token
-        # slot values BEFORE dividing by page_size. The earlier version divided
-        # first and then translated page-granularity indices through a slot-index
-        # map -> wrong SWA page table -> the 50 sliding layers read the wrong KV
-        # -> decode garbled from the first step. Build raw slots first, translate,
-        # then stride + //page_size for both full and SWA tables.
-        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        max_len = (
+            int(seq_lens_cpu.max().item())
+            if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0
+            else int(seq_lens.max().item()) if seq_lens.numel() > 0 else 1
+        )
+        metadata.max_seq_len_k = max(1, max_len)
+
+        max_seq_pages = (metadata.max_seq_len_k + self.page_size - 1) // self.page_size
         if max_seq_pages > 0:
-            req_pool_indices = forward_batch.req_pool_indices[:bs]
-            # Raw token-granularity KV slots for [0, max_len).
-            raw_slots = self.req_to_token[req_pool_indices, :max_len]
-
-            # Full-pool page table: stride by page_size then divide.
             strided_indices = state["strided_indices"][:max_seq_pages]
             pt = (
-                self.req_to_token[req_pool_indices[:, None], strided_indices[None, :]]
+                self.req_to_token[
+                    req_pool_indices[:, None],
+                    strided_indices[None, :],
+                ]
                 // self.page_size
             )
             metadata.page_table[:bs, :max_seq_pages].copy_(pt)
 
-            # SWA page table: translate RAW slots first, then stride + divide.
-            if self.use_sliding_window_kv_pool:
-                swa_slots = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    raw_slots
-                ).to(torch.int32)
-                swa_pt = swa_slots[:, ::self.page_size] // self.page_size
-                swa_buf = state["swa_page_table"][:bs, :]
-                # Write into the persistent (address-stable) graph buffer so the
-                # captured sliding layers read it at a fixed address across replays.
-                swa_buf[:, :swa_pt.shape[1]].copy_(swa_pt)
-                metadata.swa_page_table = swa_buf
-
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
+        # Token-granular kv_indptr/kv_indices for sglang_decode_attn (flat-NHD).
+        # Written into pre-allocated graph-stable buffers so their data_ptr is
+        # constant across replays. kv_indptr[i+1] = prefix-sum of seq_lens.
+        if _sglang_decode_attn_fn is not None:
+            kv_indptr = state["kv_indptr"][: bs + 1]
+            kv_indptr[0] = 0
+            torch.cumsum(
+                metadata.cache_seqlens_int32,
+                dim=0,
+                dtype=torch.int32,
+                out=kv_indptr[1:],
             )
-            n = swa_loc.shape[0]
-            loc_buf = state["swa_out_cache_loc"][:n]
-            loc_buf.copy_(swa_loc)
-            metadata.swa_out_cache_loc = loc_buf
+            kv_indices = state["kv_indices"]
+            from sglang.srt.layers.attention.triton_ops.kv_indices import (
+                create_flashinfer_kv_indices_triton,
+            )
 
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                metadata.cache_seqlens_int32,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            metadata.kv_indptr = kv_indptr
+            metadata.kv_indices = kv_indices
+
+        state["captured"][bs] = metadata
         self.forward_metadata = metadata
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        """No-op: metadata already set by init_forward_metadata_out_graph."""
-        pass
+        """Graph-recordable setup hook. XPU uses preallocated metadata buffers."""
+        if not self._graph_state:
+            self.init_forward_metadata(forward_batch)
+            return
+        self.forward_metadata = self._graph_state["captured"].get(
+            forward_batch.batch_size, self.forward_metadata
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -713,24 +809,52 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=None,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
-                **kwargs,
+            # 腿C (#69): for fp16 HD=256 prefill, prefer the PTL-proven DPAS SDPA
+            # kernel over the cutlass-sycl flash fp16 path (which NaNs / produces
+            # garbage prefill logits on this Xe stack). Gated by
+            # SGL_XPU_PREFILL_DPAS=1; falls through to flash_attn_with_kvcache when
+            # off / ineligible / op missing.
+            _dpas = (
+                _get_prefill_dpas_op()
+                if (
+                    os.environ.get("SGL_XPU_PREFILL_DPAS") == "1"
+                    and q.dtype == torch.float16
+                    and layer.head_dim == 256
+                    and not layer.is_cross_attention
+                    and not use_cascade_attn
+                )
+                else None
             )
+            if _dpas is not None:
+                result = _dpas(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache,
+                    value_cache,
+                    cu_seqlens_q.to(torch.int32),
+                    cache_seqlens.to(torch.int32),
+                    causal,
+                    float(layer.scaling),
+                    page_table.to(torch.int32),
+                )
+            else:
+                result = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    **kwargs,
+                )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -988,10 +1112,31 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
 
+            is_swa_layer = (
+                layer.sliding_window_size is not None and layer.sliding_window_size > -1
+            )
+            page_table = metadata.page_table
+            # For SWA layers on hybrid models, use the translated
+            # SWA-pool page table so KV reads hit the correct pool.
+            if is_swa_layer and self.use_sliding_window_kv_pool:
+                if metadata.swa_page_table is not None:
+                    page_table = metadata.swa_page_table
+                else:
+                    page_table = (
+                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            metadata.page_table
+                        ).to(torch.int32)
+                    )
+
+            cache_seqlens = metadata.cache_seqlens_int32
+            cu_seqlens_k = metadata.cu_seqlens_k
+            max_seqlen_q = metadata.max_seq_len_q
+            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
                 o = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=metadata.encoder_page_table,
@@ -1010,7 +1155,7 @@ class XPUAttentionBackend(AttentionBackend):
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
                 o = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=local_attn_metadata.local_block_table,
@@ -1026,218 +1171,73 @@ class XPUAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     **kwargs,
                 )
+            elif (
+                self._graph_state.get("temp_p") is not None
+                and not use_cascade_attn
+                and _sglang_decode_attn_fn is not None
+                and getattr(metadata, "kv_indices", None) is not None
+                and layer.head_dim == 256
+                and layer.tp_q_head_num % layer.tp_k_head_num == 0
+                and os.environ.get("SGL_XPU_DECODE_SGLANG_ATTN", "1") == "1"
+            ):
+                # Proven-correct flat-NHD token-granular decode kernel. The paged
+                # eagle_page_attn_decode is numerically wrong for GQA ratio=8 /
+                # single-KV-head on this stack, so route graph decode here.
+                B = forward_batch.batch_size
+                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_buf = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                q_fp16 = q_reshaped.view(B, layer.tp_q_head_num, layer.head_dim)
+                if q_fp16.dtype != torch.float16:
+                    q_fp16 = q_fp16.to(torch.float16)
+                if k_buf.dtype != torch.float16:
+                    k_buf = k_buf.to(torch.float16)
+                    v_buf = v_buf.to(torch.float16)
+                o_fp16 = torch.empty_like(q_fp16)
+                _sglang_decode_attn_fn(
+                    q_fp16,
+                    k_buf,
+                    v_buf,
+                    metadata.kv_indptr,
+                    metadata.kv_indices,
+                    o_fp16,
+                    float(layer.scaling),
+                    self._graph_state["sglang_temp_p"],
+                    self._sglang_decode_graph_max_seq,
+                )
+                o = o_fp16.view(-1, layer.tp_q_head_num, layer.head_dim)
+            elif self._graph_state.get("temp_p") is not None and not use_cascade_attn:
+                o = torch.empty_like(q_reshaped)
+                eagle_page_attn_decode(
+                    q_reshaped,
+                    key_cache,
+                    value_cache,
+                    page_table,
+                    cache_seqlens,
+                    o,
+                    max_seqlen_q,
+                    metadata.max_seq_len_k,
+                    self._graph_state["temp_p"],
+                )
             else:
-                is_swa_layer = (
-                    layer.sliding_window_size is not None
-                    and layer.sliding_window_size > -1
+                # Default: single-token self-attention
+                result = flash_attn_with_kvcache(
+                    q=q_reshaped,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    cu_seqlens_k_new=None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    **kwargs,
                 )
-
-                page_table = metadata.page_table
-                # For SWA layers on hybrid models, use the translated
-                # SWA-pool page table so KV reads hit the correct pool.
-                if is_swa_layer and self.use_sliding_window_kv_pool:
-                    if metadata.swa_page_table is not None:
-                        page_table = metadata.swa_page_table
-                    else:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                metadata.page_table
-                            ).to(torch.int32)
-                        )
-
-                cache_seqlens = metadata.cache_seqlens_int32
-                cu_seqlens_k = metadata.cu_seqlens_k
-                max_seqlen_q = metadata.max_seq_len_q
-                q_reshaped = q.contiguous().view(
-                    -1, layer.tp_q_head_num, layer.head_dim
-                )
-
-                # ESIMD page_attn_decode fast path: no SLM, graph-capturable.
-                # Fires for head_dim==256 layers, which for gemma4 are the SWA
-                # (sliding-window) layers (global layers have head_dim=512 and
-                # take the split-K path below). SWA windowing is handled inside
-                # the kernel via the `window` param (see the SWA branch below):
-                # positions outside the last `window` tokens are masked to -inf,
-                # matching FA3's window_size semantics.
-                _use_esimd_pa = (
-                    not _DISABLE_ESIMD_DECODE
-                    and not _DISABLE_PAGE_ATTN
-                    and _esimd_page_attn_decode is not None
-                    and layer.head_dim == 256
-                    and max_seqlen_q == 1
-                    and not use_cascade_attn
-                    and layer.logit_cap == 0.0
-                    and q_reshaped.dtype == torch.float16
-                )
-                if _use_esimd_pa:
-                    bs = forward_batch.batch_size
-                    # Persistent per-layer buffers: under XPU graph, capture bakes
-                    # tensor addresses, so fresh torch.empty()/elementwise temporaries
-                    # get unstable addresses across replay and corrupt decode. Reuse
-                    # stable buffers + in-place ops so capture and replay match.
-                    out_pa = self._decode_buf(
-                        ("pa_out", layer.layer_id), (bs, layer.tp_q_head_num, layer.head_dim),
-                        torch.float16, q_reshaped.device,
-                    )
-                    pa_seqlens = cache_seqlens
-                    page_table_pa = page_table
-                    max_seq = page_table.shape[1] * self.page_size
-                    # Sliding-window (SWA) layers: the ESIMD kernel reads the full
-                    # [0, seq_len) page table. Once seq_len > window, positions
-                    # older than the window have been evicted from the SWA pool
-                    # and their full->swa mapping points to slot 0 (another
-                    # token's KV = garbage), which garbled decode output. The old
-                    # clamp hack kept the FIRST window+1 columns (the OLDEST /
-                    # evicted positions) so it read garbage too.
-                    #
-                    # Fix WITHOUT any kernel change: page-align the page table to
-                    # the LAST `window` tokens and pass the reduced seq_len, so
-                    # the kernel only ever reads resident, in-window KV. The SWA
-                    # pool evicts per page (page_size), so the window-boundary
-                    # page is resident whenever it holds any in-window token;
-                    # floor-aligning the start therefore reads only valid slots
-                    # (it may attend up to page_size-1 extra, still-resident,
-                    # slightly-older tokens — a benign superset of FA3's
-                    # window_size=(sliding_window_size,0)). This also shrinks the
-                    # decode grid for long sequences.
-                    #
-                    # The windowed table depends only on cache_seqlens + the SWA
-                    # page table, which are identical across all ~50 SWA layers
-                    # in a step. Compute it ONCE per step and cache on the
-                    # (per-step-fresh) metadata object; recomputing per layer
-                    # added ~7ms TPOT (50x redundant host work).
-                    #
-                    # bs==1 (the shippable --max-running-requests 1 config) takes
-                    # a host-side fast path: the window is a CONTIGUOUS page span
-                    # [start_page : start_page+n_win_pages], so we slice the page
-                    # table (a zero-copy view) instead of building an index tensor
-                    # and gathering. start_page is derived from
-                    # metadata.max_seq_len_k, which is already a host int (no new
-                    # device->host sync). Microbench: 74us (gather) -> 8us (slice).
-                    # bs>1 keeps the gather path (per-batch start pages differ).
-                    if (
-                        is_swa_layer
-                        and layer.sliding_window_size is not None
-                        and layer.sliding_window_size > -1
-                        and metadata.max_seq_len_k > (layer.sliding_window_size + 1)
-                    ):
-                        cached = getattr(metadata, "_swa_win_cache", None)
-                        if cached is None:
-                            window_tokens = layer.sliding_window_size + 1
-                            ps = self.page_size
-                            n_win_pages = (window_tokens - 1) // ps + 2
-                            n_cols = page_table.shape[1]
-                            if bs == 1:
-                                start_pg = max(
-                                    metadata.max_seq_len_k - window_tokens, 0
-                                ) // ps
-                                end_pg = min(start_pg + n_win_pages, n_cols)
-                                pt_pa = page_table[:, start_pg:end_pg]
-                                sl = cache_seqlens - (start_pg * ps)
-                            else:
-                                start_page = (
-                                    torch.clamp(cache_seqlens - window_tokens, min=0)
-                                    // ps
-                                )
-                                col = start_page.to(torch.int64).unsqueeze(
-                                    1
-                                ) + torch.arange(
-                                    n_win_pages,
-                                    device=page_table.device,
-                                    dtype=torch.int64,
-                                )
-                                col = col.clamp_(max=n_cols - 1)
-                                pt_pa = torch.gather(page_table, 1, col)
-                                sl = (cache_seqlens - start_page * ps).to(torch.int32)
-                            cached = (pt_pa, sl, pt_pa.shape[1] * self.page_size)
-                            metadata._swa_win_cache = cached
-                        page_table_pa, pa_seqlens, max_seq = cached
-                    # ESIMD kernel hardcodes matMulQuantCoeff=0.0625 (1/sqrt(256)).
-                    # Compensate for the model's actual scaling factor.
-                    if layer.scaling != 0.0625:
-                        q_scaled = self._decode_buf(
-                            ("pa_q", layer.layer_id), q_reshaped.shape,
-                            q_reshaped.dtype, q_reshaped.device,
-                        )
-                        torch.mul(q_reshaped, layer.scaling / 0.0625, out=q_scaled)
-                    else:
-                        q_scaled = q_reshaped
-                    _esimd_page_attn_decode(
-                        q_scaled,
-                        key_cache,
-                        value_cache,
-                        page_table_pa,
-                        pa_seqlens,
-                        out_pa,
-                        max_seqlen_q,
-                        max_seq,
-                        None,
-                    )
-                    result = out_pa
-                else:
-                    # Split-K ESIMD decode (no SLM, graph-capturable) for hd512.
-                    # Falls back to flash_attn for non-decode or unsupported configs.
-                    if (
-                        not _DISABLE_ESIMD_DECODE
-                        and _splitk_decode_attention is not None
-                        and max_seqlen_q == 1
-                        and not use_cascade_attn
-                        and layer.logit_cap == 0.0
-                        and q_reshaped.dtype == torch.float16
-                        and layer.head_dim in (256, 512)
-                    ):
-                        bs = forward_batch.batch_size
-                        G = _SPLITK_G  # num KV splits (env SGLANG_SPLITK_G, default 4)
-                        nTG = bs * layer.tp_q_head_num * G
-                        hd = layer.head_dim
-                        # Persistent PER-LAYER scratch + output: under XPU graph the
-                        # 10 global layers are all captured; a single shared scratch
-                        # (or fresh torch.empty per call) gives unstable/aliased
-                        # addresses across replay and corrupts decode. One stable
-                        # buffer per layer_id keyed by size.
-                        out_sk = self._decode_buf(
-                            ("sk_out", layer.layer_id), (bs, layer.tp_q_head_num, hd),
-                            torch.float16, q_reshaped.device,
-                        )
-                        scratch = self._decode_buf(
-                            ("sk_scratch", layer.layer_id), (nTG * (hd + 2),),
-                            torch.float32, q_reshaped.device,
-                        )
-                        max_seq = page_table.shape[1] * self.page_size
-                        # Split-K kernel has built-in 1/sqrt(HD) scaling
-                        if layer.scaling != hd ** -0.5:
-                            q_scaled = self._decode_buf(
-                                ("sk_q", layer.layer_id), q_reshaped.shape,
-                                q_reshaped.dtype, q_reshaped.device,
-                            )
-                            torch.mul(q_reshaped, layer.scaling / (hd ** -0.5), out=q_scaled)
-                        else:
-                            q_scaled = q_reshaped
-                        _splitk_decode_attention(
-                            q_scaled, key_cache, value_cache,
-                            page_table, cache_seqlens,
-                            out_sk, scratch, max_seq, G,
-                        )
-                        result = out_sk
-                    else:
-                        result = flash_attn_with_kvcache(
-                            q=q_reshaped,
-                            k_cache=key_cache,
-                            v_cache=value_cache,
-                            page_table=page_table,
-                            cache_seqlens=cache_seqlens,
-                            cu_seqlens_q=metadata.cu_seqlens_q,
-                            cu_seqlens_k_new=None,
-                            max_seqlen_q=max_seqlen_q,
-                            softmax_scale=layer.scaling,
-                            causal=False if use_cascade_attn else causal,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
-                            return_softmax_lse=use_cascade_attn,
-                            **kwargs,
-                        )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
@@ -1295,27 +1295,6 @@ class XPUAttentionBackend(AttentionBackend):
 
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return out
-
-    def _decode_buf(self, key, shape, dtype, device):
-        """Return a persistent, address-stable buffer for the given (key, shape).
-
-        XPU graph capture bakes tensor data pointers; allocating fresh tensors
-        (torch.empty) or elementwise temporaries inside the captured decode
-        forward yields addresses that differ at replay -> silent corruption.
-        Caching one buffer per key (e.g. per layer_id + role) keeps the address
-        stable across capture and replay. Reallocates only if a larger shape is
-        ever requested.
-        """
-        if not hasattr(self, "_decode_bufs"):
-            self._decode_bufs = {}
-        buf = self._decode_bufs.get(key)
-        numel = 1
-        for s in shape:
-            numel *= s
-        if buf is None or buf.numel() < numel or buf.dtype != dtype:
-            buf = torch.zeros(numel, dtype=dtype, device=device)
-            self._decode_bufs[key] = buf
-        return buf[:numel].view(*shape)
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
