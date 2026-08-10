@@ -2730,12 +2730,18 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         # 1. Anchor (KV) backup
-        self.anchor_entry.host_pool.backup_from_device_all_layer(
-            self.anchor_entry.device_pool,
-            host_indices,
-            device_indices,
-            io_backend,
-        )
+        # A zero-length anchor denotes a component-only backup: the Full KV for this
+        # node is already on host and only a component (Mamba branching state) still
+        # needs persisting. Upstream routes the indices through
+        # _normalize_backup_indices() here; this branch predates that helper and passes
+        # them straight through, so only the guard is ported.
+        if host_indices.numel() > 0:
+            self.anchor_entry.host_pool.backup_from_device_all_layer(
+                self.anchor_entry.device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+            )
         # 2. Extra pool backup
         for transfer in pool_transfers or []:
             entry = self.entry_map.get(transfer.name)

@@ -1148,6 +1148,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
+        elif self._needs_incremental_component_backup(target_node):
+            # Not a new leaf, so the hit-count path above does not run -- but an
+            # existing, already-backuped node can have just gained a Mamba branching
+            # state that exists only on device. Persist it now; nothing else will.
+            self.write_backup(target_node)
         return result
 
     def _insert_helper_host(
@@ -1474,7 +1479,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     # ---- HiCache: Backup / LoadBack ----
 
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
-        """Backup a node's data from device to host (D->H)."""
+        """Backup a node's data from device to host (D->H).
+
+        Upstream #33639 splits this into build_backup_spec / _execute_kv_backup /
+        commit_backup driven by a BackupKV action; this branch keeps all three fused
+        here, so the same three edits land in one body: an incremental (component-only)
+        spec, an early-out when nothing is left to transfer, and a KV commit that is
+        skipped for a zero-length Full-KV backup.
+        """
         if self.cache_controller is None:
             return 0
 
@@ -1486,6 +1498,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        assert device_value is not None
+        # A node that is already backuped can still acquire NEW component data later --
+        # a Mamba branching state created after its Full KV was persisted. Re-sending
+        # the Full KV would duplicate it on host, so narrow the spec to the components
+        # that are actually missing: empty Full KV, plus only the not-yet-host-backed
+        # components. This is what makes the backup "incremental".
+        if node.backuped:
+            device_value = device_value[:0]
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
         # Build aux transfers, keyed per component.
@@ -1493,9 +1513,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
+            if node.component_data[comp.component_type].host_value is not None:
+                continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
+
+        # Nothing missing on host. Previously the caller guarded this with
+        # `if node.backuped: return`, which is exactly the check that made incremental
+        # component backup impossible; the decision now depends on what is left to send.
+        if device_value.numel() == 0 and not comp_xfers:
+            return 0
+
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
@@ -1517,13 +1546,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if host_indices is None:
             return 0
 
-        # Commit
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
-        self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
-            node,
-            CacheTransferPhase.BACKUP_HOST,
-            transfers=[kv_xfer],
-        )
+        # Commit. On a component-only backup there is no Full-KV host range to record,
+        # and committing an empty one would overwrite the node's existing host_value
+        # with a zero-length tensor -- silently unbacking KV that is still on host.
+        if len(host_indices) > 0:
+            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+            self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=[kv_xfer],
+            )
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 node,
@@ -1736,6 +1768,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
         return transfers
+
+    def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
+        """Whether an already-backuped node has device-only component data left.
+
+        Write-back is excluded deliberately: under that policy a device-only branching
+        state can still be discarded by eviction, so #33639 supports incremental
+        persistence for write-through only. See the note in MambaComponent.
+        """
+        if self.cache_controller is None:
+            return False
+        if self.cache_controller.write_policy == "write_back":
+            return False
+        if not node.backuped or node.write_through_pending_id is not None:
+            return False
+        return any(
+            comp.needs_incremental_backup(node)
+            for comp in self._components_tuple
+            if comp.component_type != BASE_COMPONENT_TYPE
+        )
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
