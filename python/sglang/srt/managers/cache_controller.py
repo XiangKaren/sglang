@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -55,6 +56,25 @@ logger = logging.getLogger(__name__)
 # absent: NPU has the same requirement, but we have no NPU hardware to validate against,
 # so enabling it there would be an untested behaviour change. Tracked as a TODO.
 _RECORD_STREAM_DEVICES = ("cuda", "xpu")
+
+# DIAGNOSTIC ONLY (added 2026-08-18 to bisect the BMG DEVICE_LOST hang).
+# Setting SGLANG_HICACHE_RECORD_STREAM=0 drops "xpu" from the tuple above, restoring
+# upstream's `.is_cuda` behaviour on XPU. That is NOT a fix: it reinstates the latent
+# use-after-free this guard exists to prevent (the caching allocator may recycle
+# host_indices/device_indices while the async copy on write_stream is still reading
+# them -> rare, load-dependent KV corruption instead of a hang). It exists so the hang
+# can be attributed with a flag instead of an edit, and so a clean run and a crashing
+# run come from the SAME build.
+if os.environ.get("SGLANG_HICACHE_RECORD_STREAM", "1") == "0":
+    _RECORD_STREAM_DEVICES = tuple(
+        d for d in _RECORD_STREAM_DEVICES if d != "xpu"
+    )
+    logger.warning(
+        "SGLANG_HICACHE_RECORD_STREAM=0: record_stream DISABLED on XPU for the "
+        "HiCache write/load streams. Diagnostic only -- reintroduces a latent "
+        "use-after-free on the KV copy path. Do not run this configuration for "
+        "correctness or performance results."
+    )
 
 device_module = get_device_module()
 
@@ -331,8 +351,25 @@ class HiCacheController:
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
 
-        self.write_stream = device_module.Stream()
-        self.load_stream = device_module.Stream()
+        # DIAGNOSTIC ONLY (added 2026-08-18, BMG DEVICE_LOST bisect).
+        # SGLANG_HICACHE_SINGLE_STREAM=1 puts the KV copies on the SAME queue as compute
+        # instead of two dedicated ones. That removes every cross-queue event dependency
+        # on the write/load path while leaving the copies themselves, the pinned host
+        # pool and HiRadixCache untouched -- so it separates "the two queues fail to
+        # signal each other" from "the copy itself kills the device".
+        # It is not a fix: serialising the copies behind compute forfeits the overlap
+        # that is the entire point of the host tier.
+        if os.environ.get("SGLANG_HICACHE_SINGLE_STREAM", "0") == "1":
+            self.write_stream = device_module.current_stream()
+            self.load_stream = device_module.current_stream()
+            logger.warning(
+                "SGLANG_HICACHE_SINGLE_STREAM=1: HiCache write/load copies share the "
+                "compute stream. Diagnostic only -- removes copy/compute overlap. Do "
+                "not use for performance results."
+            )
+        else:
+            self.write_stream = device_module.Stream()
+            self.load_stream = device_module.Stream()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
