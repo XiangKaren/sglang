@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import os
+import sys
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
+
+_MAMBA_DEBUG = os.environ.get("SGLANG_MAMBA_HICACHE_DEBUG", "0") == "1"
+
+def _mamba_debug(msg: str):
+    if _MAMBA_DEBUG:
+        print(f"[MAMBA_DEBUG] {msg}", file=sys.stderr, flush=True)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,

@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
+
+_HICACHE_DEBUG = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+
+def _hicache_debug(msg: str):
+    if _HICACHE_DEBUG:
+        print(f"[HICACHE_DEBUG] {msg}", file=sys.stderr, flush=True)
 
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
@@ -393,16 +400,26 @@ class HybridCacheController(BaseHiCacheController):
     def start_writing(self) -> None:
         if not self.write_queue:
             return
+        _hicache_debug(f"start_writing: queue_len={len(self.write_queue)}")
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
         )
+        _hicache_debug(f"start_writing: host={host_indices.shape}, device={device_indices.shape}, extra_pools={len(resolved_pool_transfers) if resolved_pool_transfers else 0}")
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
+        # XPU DEBUG: force sync to isolate cross-stream issues
+        _is_xpu = str(device_module).find("xpu") >= 0
+        if _is_xpu:
+            _hicache_debug("start_writing: XPU detected, forcing device sync before backup")
+            import torch
+            torch.xpu.synchronize()
+            _hicache_debug("start_writing: XPU sync done")
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            _hicache_debug("start_writing: calling backup_from_device_all_layer")
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_indices,
@@ -410,13 +427,20 @@ class HybridCacheController(BaseHiCacheController):
                 self.io_backend,
                 pool_transfers=resolved_pool_transfers,
             )
+            _hicache_debug("start_writing: backup_from_device_all_layer returned")
             finish_event.record()
+            # XPU DEBUG: force sync on write_stream to see if backup hangs
+            if _is_xpu:
+                _hicache_debug("start_writing: XPU - forcing write_stream sync after backup")
+                self.write_stream.synchronize()
+                _hicache_debug("start_writing: XPU - write_stream sync done!")
             self._record_transfer_indices_on_stream(
                 self.write_stream,
                 host_indices,
                 device_indices,
                 resolved_pool_transfers,
             )
+        _hicache_debug("start_writing: done")
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(

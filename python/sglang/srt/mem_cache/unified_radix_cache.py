@@ -2323,15 +2323,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[WRITING_CHECK] enter, write_back={write_back}", flush=True)
         cc = self.cache_controller
         if cc is None:
+            if _debug:
+                print("[WRITING_CHECK] no cache_controller, return", flush=True)
             return
 
         if write_back:
             # Blocking: wait for all pending write-backs
+            if _debug:
+                print(f"[WRITING_CHECK] write_back mode, ongoing={len(self.ongoing_write_through)}", flush=True)
             while self.ongoing_write_through:
                 for _, finish_event, ack_list in cc.ack_write_queue:
+                    if _debug:
+                        print("[WRITING_CHECK] calling finish_event.synchronize()", flush=True)
                     finish_event.synchronize()
+                    if _debug:
+                        print("[WRITING_CHECK] synchronize done", flush=True)
                     for ack_id in ack_list:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
@@ -2342,23 +2354,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
+        if _debug:
+            print(f"[WRITING_CHECK] non-write_back mode, pp_rank={self.pp_rank}, queue_len={len(cc.ack_write_queue)}", flush=True)
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_write_queue:
+                if _debug:
+                    print("[WRITING_CHECK] calling finish_event.query()", flush=True)
                 if not finish_event.query():
+                    if _debug:
+                        print("[WRITING_CHECK] query returned False, breaking", flush=True)
                     break
+                if _debug:
+                    print("[WRITING_CHECK] query returned True", flush=True)
                 finish_count += 1
 
+        if _debug:
+            print(f"[WRITING_CHECK] finish_count={finish_count}, calling all_reduce", flush=True)
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        if _debug:
+            print(f"[WRITING_CHECK] all_reduce done", flush=True)
         finish_count = finish_count_tensor.item()
 
         # Process completed acks
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
+            if _debug:
+                print("[WRITING_CHECK] calling finish_event.synchronize()", flush=True)
             finish_event.synchronize()
+            if _debug:
+                print("[WRITING_CHECK] synchronize done", flush=True)
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
+        if _debug:
+            print("[WRITING_CHECK] exit", flush=True)
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
@@ -2442,8 +2472,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print("[CHECK_HICACHE_EVENTS] enter", flush=True)
         self.writing_check()
+        if _debug:
+            print("[CHECK_HICACHE_EVENTS] writing_check done", flush=True)
         self.loading_check()
+        if _debug:
+            print("[CHECK_HICACHE_EVENTS] loading_check done", flush=True)
         if self.enable_storage:
             self.drain_storage_control_queues()
         self._reap_completed_async_work()
@@ -2451,6 +2489,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        if _debug:
+            print("[CHECK_HICACHE_EVENTS] exit", flush=True)
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""

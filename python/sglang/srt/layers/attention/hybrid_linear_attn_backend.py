@@ -155,27 +155,47 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[DEFERRED_COW_CLEAR] enter: mode={forward_batch.forward_mode}, is_draft={self.is_draft_worker}", flush=True)
         if not forward_batch.forward_mode.is_extend() or self.is_draft_worker:
+            if _debug:
+                print(f"[DEFERRED_COW_CLEAR] early return (not extend or draft)", flush=True)
             return
         if (
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0
         ):
+            if _debug:
+                print(f"[DEFERRED_COW_CLEAR] clearing {len(forward_batch.mamba_clear_indices)} slots: {forward_batch.mamba_clear_indices.tolist()[:10]}...", flush=True)
             self.req_to_token_pool.mamba_pool.clear_slots(
                 forward_batch.mamba_clear_indices
             )
+            if _debug:
+                print(f"[DEFERRED_COW_CLEAR] clear_slots done", flush=True)
         if (
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
+            if _debug:
+                print(f"[DEFERRED_COW_CLEAR] COW: {len(forward_batch.mamba_cow_src_indices)} copies, src={forward_batch.mamba_cow_src_indices.tolist()[:10]}, dst={forward_batch.mamba_cow_dst_indices.tolist()[:10]}", flush=True)
             self.req_to_token_pool.mamba_pool.copy_from(
                 forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
             )
+            if _debug:
+                print(f"[DEFERRED_COW_CLEAR] copy_from done", flush=True)
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
+        if _debug:
+            print(f"[DEFERRED_COW_CLEAR] exit", flush=True)
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[MAMBA2_BACKEND] _forward_metadata: enter, mode={forward_batch.forward_mode}", flush=True)
         bs = forward_batch.batch_size
 
         retrieve_next_token = None
@@ -187,30 +207,65 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
+        if _debug:
+            print(f"[MAMBA2_BACKEND] _forward_metadata: calling get_mamba_indices", flush=True)
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        if _debug:
+            print(f"[MAMBA2_BACKEND] _forward_metadata: get_mamba_indices done, shape={mamba_cache_indices.shape}", flush=True)
         # Translate virtual->physical BEFORE the padding sentinel below, so the
         # gather reads only real ids; padded rows are then poisoned to -1 (skipped).
+        if _debug:
+            print(f"[MAMBA2_BACKEND] _forward_metadata: calling _translate_mamba_indices", flush=True)
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
+        if _debug:
+            print(f"[MAMBA2_BACKEND] _forward_metadata: _translate done", flush=True)
         if forward_batch.mamba_track_indices is not None:
+            if _debug:
+                print(f"[MAMBA2_BACKEND] _forward_metadata: translating track_indices", flush=True)
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
+            if _debug:
+                print(f"[MAMBA2_BACKEND] _forward_metadata: track_indices translate done", flush=True)
         # Resolve the tracked-row selection once per forward
-        has_mamba_track_mask = bool(
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        )
+        if _debug:
+            print(f"[MAMBA2_BACKEND] _forward_metadata: checking has_mamba_track_mask, mask is None={forward_batch.mamba_track_mask is None}", flush=True)
+        # XPU FIX: On XPU, the .any() call can deadlock when the write_stream
+        # (HiCache backup) has a stalled operation. The sync from .any() blocks
+        # the default stream waiting for GPU resources that the write_stream is
+        # holding. Work around by assuming True if the mask tensor exists and
+        # has any elements - this is conservative but avoids the deadlock.
+        import torch
+        if forward_batch.mamba_track_mask is not None:
+            is_xpu = hasattr(torch, 'xpu') and forward_batch.mamba_track_mask.device.type == 'xpu'
+            if is_xpu:
+                # Skip .any() on XPU - assume True if mask has elements
+                has_mamba_track_mask = forward_batch.mamba_track_mask.numel() > 0
+                if _debug:
+                    print(f"[MAMBA2_BACKEND] _forward_metadata: XPU path, numel={forward_batch.mamba_track_mask.numel()}, has_mask={has_mamba_track_mask}", flush=True)
+            else:
+                has_mamba_track_mask = bool(forward_batch.mamba_track_mask.any())
+        else:
+            has_mamba_track_mask = False
+        if _debug:
+            print(f"[MAMBA2_BACKEND] _forward_metadata: has_mamba_track_mask={has_mamba_track_mask}", flush=True)
         _real_bs = getattr(forward_batch, "_original_batch_size", None)
+        if _debug:
+            print(f"[MAMBA2_BACKEND] _forward_metadata: _real_bs={_real_bs}", flush=True)
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
             mamba_cache_indices[_real_bs:] = -1
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            if _debug:
+                print(f"[MAMBA2_BACKEND] _forward_metadata: decode mode, creating query_start_loc, bs={bs}, device={self.device}", flush=True)
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
+            if _debug:
+                print(f"[MAMBA2_BACKEND] _forward_metadata: query_start_loc created", flush=True)
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
@@ -723,13 +778,23 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         ), f"{self.forward_metadata.num_decodes=} != {forward_batch.batch_size=}"
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[MAMBA2_BACKEND] init_forward_metadata: enter, mode={forward_batch.forward_mode}", flush=True)
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
+        if _debug:
+            print(f"[MAMBA2_BACKEND] init_forward_metadata: _execute_deferred done", flush=True)
         metadata = self._forward_metadata(forward_batch)
+        if _debug:
+            print(f"[MAMBA2_BACKEND] init_forward_metadata: _forward_metadata done", flush=True)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
             metadata,
             self.mamba_chunk_size,
             forward_batch,
         )
+        if _debug:
+            print(f"[MAMBA2_BACKEND] init_forward_metadata: done", flush=True)
 
     def forward(
         self,
@@ -821,13 +886,23 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[HYBRID_BACKEND] init_forward_metadata: enter, mode={forward_batch.forward_mode}", flush=True)
         if forward_batch.forward_mode.is_draft_extend_v2():
             # DRAFT_EXTEND_V2 only runs full-attn layers in the draft model,
             # so skip linear/mamba backend metadata which requires query_start_loc.
             self.full_attn_backend.init_forward_metadata(forward_batch)
             return
-        for attn_backend in self.attn_backend_list:
+        for i, attn_backend in enumerate(self.attn_backend_list):
+            if _debug:
+                print(f"[HYBRID_BACKEND] init_forward_metadata: calling backend {i} ({type(attn_backend).__name__})", flush=True)
             attn_backend.init_forward_metadata(forward_batch)
+            if _debug:
+                print(f"[HYBRID_BACKEND] init_forward_metadata: backend {i} done", flush=True)
+        if _debug:
+            print(f"[HYBRID_BACKEND] init_forward_metadata: done", flush=True)
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
