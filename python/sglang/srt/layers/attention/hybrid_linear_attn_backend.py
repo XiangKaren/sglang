@@ -147,6 +147,12 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
+        """Virtual->physical mamba slot-id translate (identity for the non-unified
+        pool). Must run everywhere mamba ids feed the SSM/conv kernels or mamba-pool
+        state ops, incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
+        return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
+
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
         if not forward_batch.forward_mode.is_extend() or self.is_draft_worker:
