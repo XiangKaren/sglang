@@ -202,7 +202,7 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_track_mask is not None
             and forward_batch.mamba_track_mask.any()
         )
-        _real_bs = forward_batch._original_batch_size
+        _real_bs = getattr(forward_batch, "_original_batch_size", None)
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
             mamba_cache_indices[_real_bs:] = -1
