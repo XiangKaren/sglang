@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -17,158 +16,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
     )
-
-
-# Lazy-loaded esimd MoE op: registers torch.ops.moe_ops.moe_forward_full_silu_routed.
-# Returns the op handle on success, None on failure (so we always fall back to Triton).
-# ESIMD MoE gates: set once at launch, constant for the process. Cached to avoid an
-# os.environ read on the per-layer MoE hot path each decode step.
-_ESIMD_MOE = os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1"
-_ESIMD_MOE_PREFILL = os.environ.get("SGL_XPU_ESIMD_MOE_PREFILL", "0") == "1"
-
-
-def _load_esimd_moe_op(fp8_variant: str = "e4m3"):
-    """Load the right ESIMD MoE silu-routed kernel for the given fp8 variant.
-
-    fp8_variant: "e4m3" → moe_forward_full_silu_routed_sglang
-                 "e5m2" → moe_forward_full_silu_routed_e5m2
-    """
-    cache = getattr(_load_esimd_moe_op, "_cached", None)
-    if cache is None:
-        cache = {}
-        _load_esimd_moe_op._cached = cache
-    if fp8_variant in cache:
-        return cache[fp8_variant]
-    op = None
-    try:
-        from custom_esimd_kernels_sglang import moe_ops as _moe_mod
-        if fp8_variant == "e5m2":
-            op = _moe_mod.moe_forward_full_silu_routed_e5m2
-        else:
-            op = _moe_mod.moe_forward_full_silu_routed_sglang
-    except Exception:
-        op = None
-    cache[fp8_variant] = op
-    return op
-
-
-
-
-
-def _try_esimd_moe_silu_routed(
-    runner_input: "TritonRunnerInput",
-    quant_info: "TritonMoeQuantInfo",
-    config,
-) -> Optional[torch.Tensor]:
-    """XPU fast path for FP8 e4m3 silu MoE: dispatch to custom ESIMD kernel.
-
-    Returns the MoE forward output tensor [T, hidden] on success, or None to
-    fall back to the Triton path. Conditions for hitting this path:
-      - hidden_states on XPU
-      - FP8 W8A8 (e4m3) quant
-      - silu activation (Qwen3-style)
-      - small T (decode + small chunked-prefill); large T falls back since the
-        kernel was tuned for small batch
-      - non-gated, non-clamp config (vanilla SwiGLU)
-    """
-    _DEBUG = os.environ.get("SGLANG_ESIMD_MOE_DEBUG", "0") == "1"
-    def _dbg(reason):
-        if _DEBUG:
-            print(f"[esimd-moe-runner] skip: {reason}", flush=True)
-
-    if not quant_info.use_fp8_w8a8:
-        _dbg(f"not fp8_w8a8")
-        return None
-    h = runner_input.hidden_states
-    if h.device.type != "xpu":
-        _dbg(f"device={h.device.type}")
-        return None
-    orig_dtype = h.dtype
-    if h.dtype != torch.float16:
-        # Kernel only supports fp16 — cast input/output once around the call.
-        h = h.to(torch.float16)
-    w13 = quant_info.w13_weight
-    w2 = quant_info.w2_weight
-    _fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-    if w13.dtype not in _fp8_dtypes or w2.dtype not in _fp8_dtypes:
-        _dbg(f"weight dtype: w13={w13.dtype} w2={w2.dtype}")
-        return None
-    if w13.dtype != w2.dtype:
-        _dbg(f"w13/w2 dtype mismatch: {w13.dtype} vs {w2.dtype}")
-        return None
-    # Only "silu" activation supported; gelu_tanh would need a separate wrapper.
-    if getattr(config, "activation", "silu") != "silu":
-        _dbg(f"act={getattr(config, 'activation', '?')}")
-        return None
-    # No gated/clamp transforms.
-    if getattr(config, "gemm1_alpha", None) is not None:
-        _dbg("gemm1_alpha set")
-        return None
-    if getattr(config, "gemm1_clamp_limit", None) is not None:
-        _dbg("gemm1_clamp_limit set")
-        return None
-    if getattr(config, "swiglu_limit", None) is not None:
-        _dbg("swiglu_limit set")
-        return None
-    T = h.shape[0]
-    if T > 8:  # Tuned for decode + tiny prefill chunks
-        _dbg(f"T={T} > 8")
-        return None
-    fp8_variant = "e5m2" if w13.dtype == torch.float8_e5m2 else "e4m3"
-    op = _load_esimd_moe_op(fp8_variant)
-    if op is None:
-        _dbg(f"op not loaded ({fp8_variant})")
-        return None
-    if _DEBUG:
-        print(f"[esimd-moe] HIT T={T} hidden={h.shape[1]} top_k={runner_input.topk_ids.shape[-1]} fp8={fp8_variant}", flush=True)
-
-    # Collapse per-block weight_scale to per-expert per-tensor (mean), cached
-    # on the parameter tensor to amortise across calls.
-    def _per_expert_pt_scale(scale: torch.Tensor) -> torch.Tensor:
-        cached = getattr(scale, "_esimd_pt_per_expert", None)
-        if cached is not None:
-            return cached
-        # scale: [E, *block_dims] → per-expert mean → [E] fp32
-        s = scale.to(torch.float32).reshape(scale.shape[0], -1).mean(dim=-1)
-        s = s.contiguous()
-        try:
-            scale._esimd_pt_per_expert = s
-        except Exception:
-            pass
-        return s
-
-    if quant_info.w13_scale is None or quant_info.w2_scale is None:
-        return None
-    s13 = _per_expert_pt_scale(quant_info.w13_scale)
-    s2 = _per_expert_pt_scale(quant_info.w2_scale)
-
-    # Both the e4m3 (`_sglang`) and e5m2 kernel variants now accept w13 directly
-    # in sglang's [E, 2*intermediate, hidden] N-major layout — no transpose /
-    # extra copy, and the Triton fallback reads the same parameter unchanged.
-    w13_kernel = w13
-
-    topk_w = runner_input.topk_weights
-    topk_i = runner_input.topk_ids
-    if topk_w.dtype != torch.float16:
-        topk_w = topk_w.to(torch.float16)
-    if topk_i.dtype != torch.int32:
-        topk_i = topk_i.to(torch.int32)
-
-    top_k = topk_i.shape[-1]
-    n_routed = w13.shape[0]
-    try:
-        out = op(h, topk_w, topk_i, w13_kernel, s13, w2, s2, top_k, n_routed)
-    except Exception:
-        return None
-    if out.dtype != orig_dtype:
-        out = out.to(orig_dtype)
-    return out
 
 
 @dataclass
@@ -202,6 +56,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     b13: Optional[torch.Tensor] = None
     b2: Optional[torch.Tensor] = None
+    use_mxfp8: bool = False
     use_fp8_w8a8: bool = False
     use_int8_w8a8: bool = False
     use_int8_w8a16: bool = False
@@ -214,6 +69,9 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # w13 rows were permuted to interleave gate/up at load, so the activation
+    # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
+    fuse_swiglu_interleaved: bool = False
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -228,14 +86,39 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
-        # XPU fast path: gated by SGL_XPU_ESIMD_MOE=1. The fused-func
-        # path (`fused_experts_none_to_triton`) is the one that actually fires
-        # under the default runner config; this branch is here for the future
-        # case where a runner_input gets routed straight into the runner_core.
-        if _ESIMD_MOE:
-            out = _try_esimd_moe_silu_routed(runner_input, quant_info, self.config)
-            if out is not None:
-                return TritonRunnerOutput(hidden_states=out)
+        if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
+            from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
+                fused_experts_mxfp8,
+            )
+
+            out = fused_experts_mxfp8(
+                runner_input.hidden_states,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                runner_input.topk_weights,
+                runner_input.topk_ids,
+                quant_info.w13_scale,
+                quant_info.w2_scale,
+                b1=quant_info.b13,
+                b2=quant_info.b2,
+                activation=self.config.activation,
+                is_gated=self.config.is_gated,
+                no_combine=self.config.no_combine,
+                inplace=self.config.inplace,
+                apply_router_weight_on_input=self.config.apply_router_weight_on_input,
+                routed_scaling_factor=self.config.routed_scaling_factor,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_limit=self.config.gemm1_clamp_limit,
+                swiglu_limit=self.config.swiglu_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
+            )
+            return TritonRunnerOutput(hidden_states=out)
+
+        if quant_info.use_mxfp8 and is_cuda():
+            raise NotImplementedError(
+                "Triton MoE runner does not support NVIDIA MXFP8; use "
+                "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
+            )
 
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             _fused_moe_kernel_sequence,
@@ -258,6 +141,7 @@ class TritonRunnerCore(MoeRunnerCore):
             running_state["config"],
             running_state.get("down_config"),
             running_state.get("down_moe_use_tma", False),
+            running_state.get("up_moe_use_tma", False),
             b1=quant_info.b13,
             b2=quant_info.b2,
             use_fp8_w8a8=quant_info.use_fp8_w8a8,
@@ -283,6 +167,7 @@ class TritonRunnerCore(MoeRunnerCore):
             filter_expert=filter_expert,
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
+            fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -292,261 +177,83 @@ class TritonRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.TRITON
 
 
-def _maybe_esimd_moe_silu_fused(
-    dispatch_output,
-    quant_info,
-    runner_config,
-):
-    """Small-T fast path for the `fused_experts_none_to_triton` entry point.
-
-    Returns the MoE output tensor on success, or None to fall back. Mirrors
-    the conditions in `_try_esimd_moe_silu_routed` plus extracts the topk
-    weights/ids from the StandardDispatchOutput.
-    """
-    if not quant_info.use_fp8_w8a8:
-        return None
-    h = dispatch_output.hidden_states
-    if h.device.type != "xpu":
-        return None
-    w13 = quant_info.w13_weight
-    w2 = quant_info.w2_weight
-    _fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-    if w13.dtype not in _fp8_dtypes or w2.dtype not in _fp8_dtypes:
-        return None
-    if w13.dtype != w2.dtype:
-        return None
-    if getattr(runner_config, "activation", "silu") != "silu":
-        return None
-    if getattr(runner_config, "gemm1_alpha", None) is not None:
-        return None
-    if getattr(runner_config, "gemm1_clamp_limit", None) is not None:
-        return None
-    if getattr(runner_config, "swiglu_limit", None) is not None:
-        return None
-    if quant_info.b13 is not None or quant_info.b2 is not None:
-        return None
-    if h.shape[0] > 8:
-        return None
-    fp8_variant = "e5m2" if w13.dtype == torch.float8_e5m2 else "e4m3"
-    op = _load_esimd_moe_op(fp8_variant)
-    if op is None:
-        return None
-
-    topk_weights, topk_ids, _ = dispatch_output.topk_output
-
-    def _per_expert_pt_scale(scale):
-        cached = getattr(scale, "_esimd_pt_per_expert", None)
-        if cached is not None:
-            return cached
-        s = scale.to(torch.float32).reshape(scale.shape[0], -1).mean(dim=-1)
-        s = s.contiguous()
-        try:
-            scale._esimd_pt_per_expert = s
-        except Exception:
-            pass
-        return s
-
-    if quant_info.w13_scale is None or quant_info.w2_scale is None:
-        return None
-    s13 = _per_expert_pt_scale(quant_info.w13_scale)
-    s2 = _per_expert_pt_scale(quant_info.w2_scale)
-
-    # Both e4m3 and e5m2 kernel variants accept w13 in [E, 2*inter, hidden]
-    # (N-major) directly — no transpose / extra copy.
-    w13_kernel = w13
-
-    if topk_weights.dtype != torch.float16:
-        topk_weights = topk_weights.to(torch.float16)
-    if topk_ids.dtype != torch.int32:
-        topk_ids = topk_ids.to(torch.int32)
-    orig_dtype = h.dtype
-    x_in = h if h.dtype == torch.float16 else h.to(torch.float16)
-    top_k = topk_ids.shape[-1]
-    n_routed = w13.shape[0]
-    try:
-        out = op(x_in, topk_weights, topk_ids, w13_kernel, s13, w2, s2, top_k, n_routed)
-    except Exception:
-        return None
-    if out.dtype != orig_dtype:
-        out = out.to(orig_dtype)
-    return out
-
-
-def _load_esimd_moe_prefill_op():
-    """Lazy-load the M-tiled FP8 MoE prefill op (moe_prefill_full_fp8)."""
-    cache = getattr(_load_esimd_moe_prefill_op, "_cached", "unset")
-    if cache != "unset":
-        return cache
-    op = None
-    try:
-        from custom_esimd_kernels_sglang import moe_fp8_prefill_ops  # noqa: F401
-
-        op = torch.ops.moe_fp8_prefill_ops.moe_prefill_full_fp8
-    except Exception:
-        op = None
-    _load_esimd_moe_prefill_op._cached = op
-    return op
-
-
-def _maybe_esimd_moe_silu_prefill(
-    dispatch_output,
-    quant_info,
-    runner_config,
-):
-    """Large-T (prefill) fast path: M-tiled DPAS FP8 MoE GEMM kernel.
-
-    The decode kernel (_maybe_esimd_moe_silu_fused) is DPAS M=1 and gated to
-    T<=8; for prefill (T up to chunked_prefill_size) it would be GEMV-bound.
-    This path routes prefill batches to moe_prefill_full_fp8, which sorts tokens
-    by expert and runs a real M-tiled (MAX_M=32) DPAS GEMM. Online-fp8 weights
-    carry a per-expert per-tensor scale (w13_scale=[E,2], w2_scale=[E]); we
-    collapse w13's two scales to a per-expert mean (minor vs the block-collapse
-    that breaks block-quant checkpoints — verified numerically cos=1.0).
-
-    Returns the MoE output [T, hidden] on success, or None to fall back.
-    """
-    if not quant_info.use_fp8_w8a8:
-        return None
-    h = dispatch_output.hidden_states
-    if h.device.type != "xpu":
-        return None
-    w13 = quant_info.w13_weight
-    w2 = quant_info.w2_weight
-    _fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-    if w13.dtype not in _fp8_dtypes or w2.dtype not in _fp8_dtypes:
-        return None
-    if w13.dtype != w2.dtype:
-        return None
-    if getattr(runner_config, "activation", "silu") != "silu":
-        return None
-    if getattr(runner_config, "gemm1_alpha", None) is not None:
-        return None
-    if getattr(runner_config, "gemm1_clamp_limit", None) is not None:
-        return None
-    if getattr(runner_config, "swiglu_limit", None) is not None:
-        return None
-    if quant_info.b13 is not None or quant_info.b2 is not None:
-        return None
-    if quant_info.w13_scale is None or quant_info.w2_scale is None:
-        return None
-    # Only block_shape==None (online per-expert per-tensor) is supported by the
-    # per-expert scalar kernel; block-quant checkpoints need a block-scale kernel.
-    if getattr(quant_info, "block_shape", None) is not None:
-        return None
-    op = _load_esimd_moe_prefill_op()
-    if op is None:
-        return None
-
-    # The prefill kernel keeps gate/up scales SEPARATE (g_acc*=s_gate,
-    # u_acc*=s_up): online fp8 w13_scale is [E,2] (gate=w1, up=w3) and
-    # averaging the two to one scalar is too lossy (gsm8k garbage). Pass the
-    # [E,2] tensor straight through; w2_scale is [E].
-    # Online fp8 here uses requantize_with_max_scale, so w1 and w3 are
-    # requantized to a SINGLE common per-expert scale: w13_scale is [E] meaning
-    # the same scale for gate and up. Accept [E] (expand to [E,2], exact) and
-    # [E,2] (separate). w2_scale is [E] scalar.
-    def _f32c(scale, want_2d):
-        key = "_esimd_prefill_w13" if want_2d else "_esimd_prefill_w2"
-        cached = getattr(scale, key, None)
-        if cached is not None:
-            return cached
-        s = scale.to(torch.float32).reshape(scale.shape[0], -1)
-        if want_2d:
-            if s.shape[1] == 1:
-                s = s.expand(s.shape[0], 2)  # [E] -> [E,2], gate==up (max-scale requant)
-            elif s.shape[1] != 2:
-                return None
-        else:
-            s = s.mean(dim=-1)  # [E]
-        s = s.contiguous()
-        try:
-            setattr(scale, key, s)
-        except Exception:
-            pass
-        return s
-
-    s13 = _f32c(quant_info.w13_scale, want_2d=True)
-    s2 = _f32c(quant_info.w2_scale, want_2d=False)
-    if s13 is None or s2 is None:
-        return None
-    # NOTE: this routed-only path does NOT yet handle Qwen3.6 shared-expert
-    # fusion (shared_expert_intermediate_size == moe_intermediate_size), so the
-    # full MoE output is incomplete -> SGL_XPU_ESIMD_MOE_PREFILL must stay
-    # off until the shared expert contribution is added. Kept wired + scale-fixed
-    # for when that lands.
-
-    topk_weights, topk_ids, _ = dispatch_output.topk_output
-    if topk_weights.dtype != torch.float16:
-        topk_weights = topk_weights.to(torch.float16)
-    if topk_ids.dtype != torch.int32:
-        topk_ids = topk_ids.to(torch.int32)
-    orig_dtype = h.dtype
-    x_in = h if h.dtype == torch.float16 else h.to(torch.float16)
-    top_k = topk_ids.shape[-1]
-    n_routed = w13.shape[0]
-    try:
-        out = op(x_in, topk_weights, topk_ids, w13, s13, w2, s2, top_k, n_routed)
-    except Exception:
-        return None
-    if out.dtype != orig_dtype:
-        out = out.to(orig_dtype)
-    return out
-
-
 @register_fused_func("none", "triton")
 def fused_experts_none_to_triton(
     dispatch_output: StandardDispatchOutput,
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    # XPU fast path: small-T (decode) FP8 e4m3 silu MoE → custom ESIMD kernel.
-    # DISABLED — collapsing the per-block weight scale to a per-expert mean
-    # (the trick that worked for the GEMM fast path) destroys accuracy on
-    # MoE: gsm8k fell from 70% to 0% (output degraded to garbage tokens).
-    # The 256 experts span a wider scale range than the per-block scales of
-    # a single linear layer, so a single scalar per expert is too lossy.
-    # TODO: migrate the per-block FP8 MoE GEMM kernel from llm-scaler/vllm
-    # (or feed 2D scale through a future kernel variant) before re-enabling.
-    if _ESIMD_MOE:
-        esimd_out = _maybe_esimd_moe_silu_fused(
-            dispatch_output, quant_info, runner_config
+    if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
+        from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
+            fused_experts_mxfp8,
         )
-        if esimd_out is not None:
-            return StandardCombineInput(hidden_states=esimd_out)
 
-    # Large-T (prefill) M-tiled DPAS FP8 MoE kernel. Separate env gate so it can
-    # be enabled independently of the decode kernel.
-    if _ESIMD_MOE_PREFILL:
-        esimd_out = _maybe_esimd_moe_silu_prefill(
-            dispatch_output, quant_info, runner_config
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        output = fused_experts_mxfp8(
+            hidden_states=dispatch_output.hidden_states,
+            w1=quant_info.w13_weight,
+            w2=quant_info.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            w1_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            b1=quant_info.b13,
+            b2=quant_info.b2,
+            activation=runner_config.activation,
+            is_gated=runner_config.is_gated,
+            no_combine=runner_config.no_combine,
+            inplace=runner_config.inplace,
+            apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
+            routed_scaling_factor=runner_config.routed_scaling_factor,
+            gemm1_alpha=runner_config.gemm1_alpha,
+            gemm1_limit=runner_config.gemm1_clamp_limit,
+            swiglu_limit=runner_config.swiglu_limit,
+            gate_up_interleaved=runner_config.gate_up_interleaved,
         )
-        if esimd_out is not None:
-            return StandardCombineInput(hidden_states=esimd_out)
+    else:
+        if quant_info.use_mxfp8 and is_cuda():
+            raise NotImplementedError(
+                "Triton MoE runner does not support NVIDIA MXFP8; use "
+                "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
+            )
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+            fused_experts,
+        )
 
-    output = fused_experts(
-        hidden_states=dispatch_output.hidden_states,
-        w1=quant_info.w13_weight,
-        w2=quant_info.w2_weight,
-        topk_output=dispatch_output.topk_output,
-        moe_runner_config=runner_config,
-        b1=quant_info.b13,
-        b2=quant_info.b2,
-        use_fp8_w8a8=quant_info.use_fp8_w8a8,
-        use_int8_w8a8=quant_info.use_int8_w8a8,
-        use_int8_w8a16=quant_info.use_int8_w8a16,
-        use_int4_w4a16=quant_info.use_int4_w4a16,
-        per_channel_quant=quant_info.per_channel_quant,
-        w1_scale=quant_info.w13_scale,
-        w2_scale=quant_info.w2_scale,
-        w1_zp=quant_info.w13_zp,
-        w2_zp=quant_info.w2_zp,
-        a1_scale=quant_info.a13_scale,
-        a2_scale=quant_info.a2_scale,
-        block_shape=quant_info.block_shape,
-    )
+        # SGLANG_OPT_MOE_QUANT_ONCE: use the caller's pre-quantized activation
+        # (per-token-group-128 fp8 q + scales) instead of re-quantizing inside
+        # invoke_fused_moe_kernel.
+        pre_quant = dispatch_output.hidden_states_pre_quant
+        if pre_quant is not None:
+            a1_q, a1_scale = pre_quant
+        else:
+            a1_q, a1_scale = None, quant_info.a13_scale
+
+        output = fused_experts(
+            hidden_states=dispatch_output.hidden_states,
+            w1=quant_info.w13_weight,
+            w2=quant_info.w2_weight,
+            topk_output=dispatch_output.topk_output,
+            moe_runner_config=runner_config,
+            b1=quant_info.b13,
+            b2=quant_info.b2,
+            use_fp8_w8a8=quant_info.use_fp8_w8a8,
+            use_int8_w8a8=quant_info.use_int8_w8a8,
+            use_int8_w8a16=quant_info.use_int8_w8a16,
+            use_int4_w4a16=quant_info.use_int4_w4a16,
+            per_channel_quant=quant_info.per_channel_quant,
+            w1_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            w1_zp=quant_info.w13_zp,
+            w2_zp=quant_info.w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=quant_info.a2_scale,
+            block_shape=quant_info.block_shape,
+            a1_q=a1_q,
+            fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+        )
 
     return StandardCombineInput(
         hidden_states=output,
@@ -561,8 +268,7 @@ def pre_permute_standard_to_triton(
     running_state: dict,
 ) -> TritonRunnerInput:
 
-    # NOTE: this is dead code as a fused func for standard format is registered.
-    # This is left here for testing and examples.
+    # Registered fallback for format-conversion tests and examples.
 
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         _prepare_fused_moe_run,
@@ -580,6 +286,7 @@ def pre_permute_standard_to_triton(
         config,
         down_config,
         down_moe_use_tma,
+        up_moe_use_tma,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -599,6 +306,7 @@ def pre_permute_standard_to_triton(
     running_state["config"] = config
     running_state["down_config"] = down_config
     running_state["down_moe_use_tma"] = down_moe_use_tma
+    running_state["up_moe_use_tma"] = up_moe_use_tma
 
     return TritonRunnerInput(
         hidden_states=hidden_states,
@@ -618,8 +326,7 @@ def post_permute_triton_to_standard(
     running_state: dict,
 ) -> StandardCombineInput:
 
-    # NOTE: this is dead code as a fused func for standard format is registered.
-    # This is left here for testing and examples.
+    # Registered fallback for format-conversion tests and examples.
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
