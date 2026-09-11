@@ -37,6 +37,17 @@ elif is_xpu():
         fused_sigmoid_gating_delta_rule_update,
     )
 
+    # Triton-XPU 3.7.0 cannot compile the block-pointer-heavy GDN extend
+    # kernels (chunk_delta_h / chunk_fwd / chunk_o). Route extend() through a
+    # pure-PyTorch reference implementation until the Intel Triton backend
+    # supports these patterns. decode() / target_verify() still use Triton,
+    # since those kernels compile successfully today.
+    from sglang.kernels.ops.attention.fla.chunk_torch_xpu import (
+        chunk_gated_delta_rule_torch,
+    )
+
+    chunk_gated_delta_rule = chunk_gated_delta_rule_torch
+
 
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""

@@ -56,6 +56,8 @@ class RadixLinearAttention(nn.Module):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        # Optional: pass conv module for lazy weight access (fixes layered_fp8 loading)
+        conv_module: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -69,13 +71,41 @@ class RadixLinearAttention(nn.Module):
         self.k_dim = num_k_heads * head_k_dim
         self.v_dim = num_v_heads * head_v_dim
 
-        self.conv_weights = conv_weights
-        self.bias = bias
+        self._conv_weights = conv_weights
+        self._conv_module = conv_module
+        self._bias = bias
         self.activation = activation
 
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
+
+    @property
+    def conv_weights(self):
+        """Return conv weights, computing view lazily from module if available.
+
+        This fixes device mismatch with layered_fp8 loading where the weight
+        tensor is replaced after init.
+        """
+        if self._conv_module is not None:
+            w = self._conv_module.weight
+            return w.view(w.size(0), w.size(2))
+        return self._conv_weights
+
+    @conv_weights.setter
+    def conv_weights(self, value):
+        self._conv_weights = value
+
+    @property
+    def bias(self):
+        """Return bias, accessing from conv module if available."""
+        if self._conv_module is not None:
+            return self._conv_module.bias
+        return self._bias
+
+    @bias.setter
+    def bias(self, value):
+        self._bias = value
 
     def forward(
         self,

@@ -55,6 +55,11 @@ if is_cuda():
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
+elif is_xpu():
+    from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
+
+    causal_conv1d_fn = causal_conv1d_fn_xpu
+    causal_conv1d_update = causal_conv1d_update_xpu
 elif is_npu():
     from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
     from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -776,15 +781,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
                 conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
+                    mixed_qkv_to_track.to(conv_states.dtype)
                 )
 
+            conv_weight = layer.conv_weights
+            conv_bias = layer.bias
+            conv_states_arg = conv_states_contig
+            if is_xpu():
+                target_device = mixed_qkv.device
+                target_dtype = mixed_qkv.dtype
+                if conv_weight.device != target_device:
+                    conv_weight = conv_weight.to(target_device)
+                if conv_bias is not None and conv_bias.device != target_device:
+                    conv_bias = conv_bias.to(target_device)
+                if conv_states_arg is not None and conv_states_arg.dtype != target_dtype:
+                    conv_states_arg = conv_states_arg.to(target_dtype)
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
+                conv_weight,
+                conv_bias,
                 activation=layer.activation,
-                conv_states=conv_states_contig,
+                conv_states=conv_states_arg,
                 has_initial_state=has_initial_states,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,

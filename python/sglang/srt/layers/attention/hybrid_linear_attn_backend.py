@@ -861,11 +861,25 @@ class MambaAttnBackendBase(AttentionBackend):
             # Triton always returns h; FlashInfer returns it only when checkpoints
             # were requested. Aligned-only tracking reads the final state below.
             if forward_metadata.track_ssm_h_src.numel() > 0:
-                assert h is not None
-                h = h.squeeze(0)
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
+                # The XPU torch-fallback extend path returns h=None (the rebase
+                # call site uses the state_checkpoint API and does not plumb
+                # intermediate_chunk_size). Tolerate it exactly like downstream:
+                # skip the intermediate-state snapshot rather than asserting. The
+                # final state (below) is still tracked, so generation is correct;
+                # only mid-sequence mamba-cache reuse is forgone.
+                if h is not None:
+                    h = h.squeeze(0)
+                    ssm_states[forward_metadata.track_ssm_h_dst] = h[
+                        forward_metadata.track_ssm_h_src
+                    ].to(ssm_states.dtype, copy=False)
+                else:
+                    if not getattr(self, "_warned_missing_h", False):
+                        logger.warning(
+                            "GDN extend returned no intermediate states (h=None); "
+                            "skipping mid-sequence SSM snapshot tracking. This is "
+                            "correct but forgoes intermediate mamba-cache reuse."
+                        )
+                        self._warned_missing_h = True
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src
