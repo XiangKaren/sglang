@@ -909,6 +909,14 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 
     # ===================================================================
+    # Intel XPU
+    # ===================================================================
+    # Split-K group size for XPU GEMM operations (default 64, changed from 4)
+    SGLANG_SPLITK_G = EnvInt(64)
+    # Enable ESIMD fp16 GEMV for lm_head decode on XPU
+    SGLANG_XPU_ENABLE_ESIMD_GEMV_FP16 = EnvBool(True)
+
+    # ===================================================================
     # MUSA
     # ===================================================================
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

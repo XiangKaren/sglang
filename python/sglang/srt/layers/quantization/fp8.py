@@ -2698,6 +2698,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
+            elif is_xpu():
+                moe_runner_backend = MoeRunnerBackend.INTEL_XPU
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
@@ -2705,6 +2707,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
+            or moe_runner_backend.is_intel_xpu()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
@@ -2735,6 +2738,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
+        )
+
+    def get_xpu_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.xpu import XpuMoeQuantInfo
+
+        use_fp8_w8a8 = layer.w13_weight.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
+        return XpuMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+            use_fp8_w8a8=use_fp8_w8a8,
+            w13_scale=(
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale
+            ),
+            w2_scale=(
+                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+            ),
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=self.weight_block_size,
+            block_quant=self.block_quant,
         )
 
     def apply(
@@ -2789,72 +2819,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if is_xpu() and not get_moe_runner_backend().is_triton():
-            # sgl-kernel-xpu path
-            topk_weights, topk_ids, _ = dispatch_output.topk_output
-            assert layer.w13_weight.dtype == layer.w2_weight.dtype
-            use_fp8_w8a8 = layer.w13_weight.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            )
-            use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
-            assert self.is_fp4_expert == use_mxfp4_w4a16
-
-            # TODO: Replace this hard-coded Gemma4-26B TP=2 shape gate with
-            # model/quant-config-driven kernel capability matching.
-            is_gemma4_26b_tp2 = (
-                x.dim() == 2
-                and x.shape[1] == 2816
-                and tuple(layer.w13_weight.shape) == (128, 704, 2816)
-                and tuple(layer.w2_weight.shape) == (128, 2816, 352)
-                and topk_ids.dim() == 2
-                and topk_ids.shape[1] == 8
-            )
-            if (
-                use_fp8_w8a8
-                and not self.block_quant
-                and moe_runner_config.activation == "gelu"
-                and is_gemma4_26b_tp2
-            ):
-                output = _apply_xpu_gemma4_fp8_moe(
-                    x,
-                    layer,
-                    topk_weights,
-                    topk_ids,
-                    moe_runner_config,
-                    block_quant=self.block_quant,
-                )
-                return StandardCombineInput(hidden_states=output)
-
-            from sgl_kernel import fused_experts
-
-            output = fused_experts(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                b1=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-                use_mxfp4_w4a16=use_mxfp4_w4a16,
-                use_fp8_w8a8=use_fp8_w8a8,
-                w1_scale=(
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),
-                w2_scale=(
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),
-                activation=moe_runner_config.activation,
-                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
-                gemm1_alpha=moe_runner_config.gemm1_alpha,
-                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
-                swiglu_limit=moe_runner_config.swiglu_limit,
-            )
-            return StandardCombineInput(hidden_states=output)
+        if (
+            is_xpu()
+            and getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_intel_xpu()
+        ):
+            quant_info = self.get_xpu_quant_info(layer)
+            return self.runner.run(dispatch_output, quant_info)
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
