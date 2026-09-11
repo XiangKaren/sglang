@@ -121,7 +121,21 @@ _is_xpu = is_xpu()
 _esimd_kv_scatter = None
 if _is_xpu:
     try:
-        from custom_esimd_kernels_sglang import esimd_kv_scatter as _esimd_kv_scatter
+        from custom_esimd_kernels_sglang import esimd_kv_scatter as _candidate_kv_scatter
+
+        # Importability is NOT availability. The Python wrapper imports even when
+        # the compiled ESIMD op it dispatches to
+        # (torch.ops.custom_esimd_kernels_sglang.esimd_kv_scatter) was never
+        # registered — e.g. the rebase env ships the package but not the built
+        # SYCL extension. Binding the wrapper anyway defeats the naive-fallback
+        # contract below: instead of falling through to k_cache[indices]=k, the
+        # first prefill KV-store raises AttributeError and SIGQUITs the server.
+        # Only take the fast path when the underlying torch op actually exists.
+        if hasattr(
+            getattr(torch.ops, "custom_esimd_kernels_sglang", None),
+            "esimd_kv_scatter",
+        ):
+            _esimd_kv_scatter = _candidate_kv_scatter
     except ImportError:
         pass
 
