@@ -366,22 +366,30 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     def _capture_cuda_graphs(self) -> None:
         if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
-        if self.target_worker.device != "cuda":
+        device_type = getattr(self.target_worker.device, "type", str(self.target_worker.device))
+        if device_type not in ("cuda", "xpu"):
             logger.info(
-                "Frozen-KV MTP draft CUDA graph is only supported on CUDA; "
+                "Frozen-KV MTP draft graph is only supported on CUDA/XPU; "
                 "running the draft loop eagerly on %s.",
                 self.target_worker.device,
             )
             return
 
-        from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
-            FrozenKVMTPCudaGraphRunner,
-        )
+        if device_type == "xpu":
+            from sglang.srt.hardware_backend.xpu.graph_runner.xpu_frozen_kv_mtp_graph_runner import (
+                XpuFrozenKVMTPGraphRunner,
+            )
+            GraphRunnerClass = XpuFrozenKVMTPGraphRunner
+        else:
+            from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
+                FrozenKVMTPCudaGraphRunner,
+            )
+            GraphRunnerClass = FrozenKVMTPCudaGraphRunner
 
-        logger.info("Capture Frozen-KV MTP draft cuda graph begin.")
+        logger.info("Capture Frozen-KV MTP draft %s graph begin.", device_type)
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.cuda_graph_runner = FrozenKVMTPCudaGraphRunner(self)
+        self.cuda_graph_runner = GraphRunnerClass(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self._specialized_graph_memory_usage["draft_decode"] = (
             self._specialized_graph_memory_usage.get("draft_decode", 0.0)
