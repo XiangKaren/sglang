@@ -58,6 +58,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
+    is_xpu,
     is_cpu,
     is_npu,
     is_pin_memory_available,
@@ -68,6 +69,32 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
+
+# ESIMD fp16 GEMV for XPU lm_head decode (ac94971b)
+_esimd_gemv_fp16 = None
+if _is_xpu:
+    try:
+        from custom_esimd_kernels_sglang import esimd_gemv_fp16 as _esimd_gemv_fp16
+    except ImportError:
+        try:
+            from custom_esimd_kernels_vllm import esimd_gemv_fp16 as _esimd_gemv_fp16
+        except ImportError:
+            _esimd_gemv_fp16 = None
+    # Importability is NOT op availability. A rebase/fallback XPU env can ship the
+    # custom_esimd_kernels_* Python wrapper while the compiled SYCL op was never
+    # built/registered; the wrapper then raises at first call
+    # (esimd_gemv_fp16 -> torch.ops.<ns>.esimd_gemv_fp16, AttributeError) and
+    # SIGQUITs the TP process group. SGLANG_XPU_ENABLE_ESIMD_GEMV_FP16 defaults
+    # True, so the lm_head gate below takes this path by default. Bind the fast
+    # path only when a torch.ops namespace actually registered the op; otherwise
+    # leave it None so the normal matmul below runs. (Same class as the
+    # memory_pool.py esimd_kv_scatter guard.)
+    if _esimd_gemv_fp16 is not None and not any(
+        hasattr(getattr(torch.ops, _ns, None), "esimd_gemv_fp16")
+        for _ns in ("custom_esimd_kernels_sglang", "custom_esimd_kernels_vllm")
+    ):
+        _esimd_gemv_fp16 = None
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -871,6 +898,22 @@ class LogitsProcessor(nn.Module):
                     None,  # bias
                     True,  # is_vnni
                 )
+            # XPU ESIMD fp16 GEMV for lm_head decode (M=1)
+            elif (
+                _is_xpu
+                and _esimd_gemv_fp16 is not None
+                and envs.SGLANG_XPU_ENABLE_ESIMD_GEMV_FP16.get()
+                and hidden_states.shape[0] == 1
+                and lm_head.weight.dtype == torch.float16
+            ):
+                # New ESIMD API requires pre-allocated output tensor
+                hs_fp16 = hidden_states.to(torch.float16)
+                output = torch.empty(
+                    (hs_fp16.shape[0], lm_head.weight.shape[0]),
+                    dtype=torch.float16,
+                    device=hs_fp16.device,
+                )
+                logits = _esimd_gemv_fp16(hs_fp16, lm_head.weight, output)
             elif self.rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(

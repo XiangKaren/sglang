@@ -12,6 +12,8 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
     get_attn_cp_group,
     get_attn_cp_overlap_group,
     get_attn_tensor_model_parallel_rank,
@@ -383,14 +385,6 @@ def initialize_dp_attention(
         device=torch.device(get_device().device),
     )
 
-    # sglang.srt.layers.moe.utils memoises predicates that read the DP-attention
-    # globals set above, and initialize_moe_config() runs *before* this function
-    # (scheduler init vs. model-runner init), so drop those cached values here
-    # too. Imported locally: moe.utils imports from this module.
-    from sglang.srt.layers.moe.utils import _invalidate_moe_predicate_cache
-
-    _invalidate_moe_predicate_cache()
-
 
 def is_dp_attention_enabled() -> bool:
     return get_flags().dp.enabled
@@ -398,6 +392,30 @@ def is_dp_attention_enabled() -> bool:
 
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
+
+
+def get_attention_tp_group() -> GroupCoordinator:
+    return get_attn_tp_group()
+
+
+def get_attention_tp_rank() -> int:
+    return get_attn_tensor_model_parallel_rank()
+
+
+def get_attention_tp_size() -> int:
+    return get_attn_tensor_model_parallel_world_size()
+
+
+def get_attention_cp_group() -> GroupCoordinator:
+    return get_attn_cp_group()
+
+
+def get_attention_cp_rank() -> int:
+    return get_attn_context_model_parallel_rank()
+
+
+def get_attention_cp_size() -> int:
+    return get_attn_context_model_parallel_world_size()
 
 
 def get_attention_dp_rank() -> int:
