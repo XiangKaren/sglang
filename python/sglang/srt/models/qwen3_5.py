@@ -72,7 +72,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -82,7 +82,17 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.utils import fused_qk_gemma_rmsnorm
+from sglang.srt.models.utils import WeightsMapper, fused_qk_gemma_rmsnorm
+
+# No-op weight mapper for MTP and other downstream consumers
+QWEN3_5_KV_SCALE_MAPPER = WeightsMapper()
+
+# Stubs for upstream functions not yet ported to downstream
+def _enable_qwen35_fused_ar_quant() -> bool:
+    return False
+
+def _linear_accepts_fp8_tuple(linear) -> bool:
+    return False
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -1501,7 +1511,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if (
             _is_cpu
             or _is_npu
-            or not get_global_server_args().disable_piecewise_cuda_graph
+            or not get_global_server_args().disable_decode_cuda_graph
         ):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
@@ -5044,6 +5054,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         return loaded_params
+
+    def post_load_weights(self):
+        """Rebind device views for GDN linear attention layers.
+
+        Called by model loaders after weights are moved to device. The GDN
+        conv_weights is a view of conv1d.weight captured at construction;
+        loaders that swap weight.data (e.g. layered_fp8) leave that view
+        pointing at freed CPU storage. Walk all layers and call
+        rebind_device_views() on any that have it.
+        """
+        for layer in self.model.layers:
+            if hasattr(layer, "linear_attn") and hasattr(
+                layer.linear_attn, "rebind_device_views"
+            ):
+                layer.linear_attn.rebind_device_views()
 
     @property
     def routed_experts_weights_of_layer(self):
