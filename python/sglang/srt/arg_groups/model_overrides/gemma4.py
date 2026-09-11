@@ -17,6 +17,19 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def is_gemma4_modelopt_fp4_moe(server_args: Any) -> bool:
+    """Detect Gemma4 MoE with modelopt_fp4 quantization.
+    
+    SM10X trtllm_mha has accuracy issues with this combination, requiring
+    fallback to triton attention backend.
+    """
+    model_config = model_config_of(server_args)
+    return (
+        model_config.quantization == "modelopt_fp4"
+        and getattr(model_config.hf_text_config, "enable_moe_block", False)
+    )
+
+
 @_register_for(
     "Gemma4ForConditionalGeneration",
     "Gemma4ForCausalLM",
@@ -25,8 +38,17 @@ logger = logging.getLogger(__name__)
 def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    default_attention_backend = "trtllm_mha" if get_platform().is_sm100 else "triton"
+    
+    # SM10X trtllm_mha has accuracy issues with MoE + modelopt_fp4
+    use_trtllm_mha = get_platform().is_sm100 and not is_gemma4_modelopt_fp4_moe(server_args)
+    default_attention_backend = "trtllm_mha" if use_trtllm_mha else "triton"
+    
     if is_attention_backend_not_set(cfg):
+        if get_platform().is_sm100 and is_gemma4_modelopt_fp4_moe(server_args):
+            logger.info(
+                "Gemma4 MoE with modelopt_fp4 detected on SM100: "
+                "falling back to triton attention backend (trtllm_mha accuracy issue)"
+            )
         logger.info(
             f"Use {default_attention_backend} as default attention backend for Gemma4"
         )
