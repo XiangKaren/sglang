@@ -138,6 +138,55 @@ def _np_bad(t):
     return (int(torch.isnan(t).sum().item()), int(torch.isinf(t).sum().item()))
 
 
+# --- SGL_XPU_DUMP_ACTS: one-shot residual-stream dump for -0518-vs-hicache
+# layer diff. Saves the residual stream (hidden_states + residual) entering
+# every decoder layer, plus input_ids and the final pre/post-norm hidden, on
+# the FIRST extend/prefill forward, TP rank 0 only. Zero overhead unless
+# SGL_XPU_DUMP_ACTS=1. Deterministic-greedy single forward => a sequential
+# capture of the two servers is equivalent to a concurrent one.
+_DUMP_ACTS = _os_np.environ.get("SGL_XPU_DUMP_ACTS", "0") == "1"
+_DUMP_DIR = _os_np.environ.get("SGL_XPU_ACTS_DIR", "/tmp/acts")
+_DRILL_LAYER = int(_os_np.environ.get("SGL_XPU_DRILL_LAYER", "3"))
+# Trigger file: the dump/drill one-shots fire only on the first extend AFTER
+# this file appears, so the boot-time WARMUP forward (fired before the file is
+# armed) is never captured — only the real request sent after arming.
+_DUMP_TRIGGER = _os_np.environ.get("SGL_XPU_DUMP_TRIGGER", "/tmp/dw_dump_arm")
+_dump_state = {"done": False}
+_drill_state = {"done": False}
+
+
+def _dump_armed():
+    return _os_np.path.exists(_DUMP_TRIGGER)
+
+
+def _dump_save(name, t):
+    try:
+        _os_np.makedirs(_DUMP_DIR, exist_ok=True)
+        torch.save(
+            t.detach().to(torch.float32).cpu(),
+            _os_np.path.join(_DUMP_DIR, name),
+        )
+    except Exception as _e:  # never let a debug dump take down the server
+        logger.error("dump_save %s failed: %s", name, _e)
+
+
+def _drill_gate(layer_id, forward_batch):
+    """True on the first extend/prefill forward, TP rank 0, for the drilled
+    layer. One-shot via _drill_state."""
+    if not _DUMP_ACTS or _drill_state["done"] or layer_id != _DRILL_LAYER:
+        return False
+    if not _dump_armed():
+        return False
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank as _tp
+        if _tp() != 0:
+            return False
+    except Exception:
+        pass
+    _fm = getattr(forward_batch, "forward_mode", None)
+    return bool(_fm is not None and _fm.is_extend())
+
+
 def _nan_probe(tag, t, layer_id=None, forward_batch=None, residual=None):
     if not _NAN_PROBE:
         return
@@ -3115,6 +3164,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         path), the ``qkv_proj`` GEMV is skipped and the supplied ``[1, N]`` fp16
         qkv tensor is fed straight into the ESIMD split/norm/rope path.
         """
+        if _drill_gate(self.layer_id, forward_batch):
+            _im_ok = None
+            try:
+                import custom_esimd_kernels_sglang as _ck_dbg
+                _im_ok = hasattr(_ck_dbg, "esimd_qkv_split_norm_rope")
+            except Exception as _e_dbg:
+                _im_ok = f"IMPORT_FAIL:{_e_dbg}"
+            _esimd_would_fire = bool(
+                _XPU_FA_ESIMD_QKV
+                and self.head_dim == 256
+                and (
+                    precomputed_qkv is not None
+                    or (hidden_states.dim() == 2 and hidden_states.dtype == torch.float16)
+                )
+            )
+            logger.error(
+                "FAGATE layer=%s FA_ESIMD_QKV=%s head_dim=%s precomp=%s "
+                "hs.dim=%s hs.dtype=%s extend=%s import_ok=%s => ESIMD_GATE=%s",
+                self.layer_id, _XPU_FA_ESIMD_QKV, self.head_dim,
+                precomputed_qkv is not None, hidden_states.dim(),
+                hidden_states.dtype,
+                forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(),
+                _im_ok, _esimd_would_fire,
+            )
         # vllm parity: fuse split + qk_norm + rope into single ESIMD call.
         # Hard-coded requirements: head_dim=256, fp16 model, GemmaRMSNorm
         # weight+1.0 convention. The kernel is fp16-only; on a bf16 model the
@@ -3227,11 +3300,25 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     if self.attn_output_gate
                     else None
                 )
+                _esimd_drill = _drill_gate(self.layer_id, forward_batch)
+                if _esimd_drill:
+                    _dump_save("E3_qkv_in.pt", qkv_fp16)  # kernel INPUT
+                    _dump_save("E3_q.pt", q)
+                    _dump_save("E3_k.pt", k)
+                    _dump_save("E3_v.pt", v)
+                    if gate is not None:
+                        _dump_save("E3_gate.pt", gate)
                 attn_output = self.attn(q, k, v, forward_batch)
+                if _esimd_drill:
+                    _dump_save("E3_sdpa_out.pt", attn_output)
                 if self.attn_output_gate:
                     # ESIMD kernel already applies sigmoid; don't re-sigmoid.
                     attn_output = attn_output * gate
+                if _esimd_drill:
+                    _dump_save("E3_gated_out.pt", attn_output)
                 output, _ = self.o_proj(attn_output)
+                if _esimd_drill:
+                    _dump_save("E3_oproj_out.pt", output)
                 return output
 
         if (
@@ -3250,11 +3337,25 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        _inner_drill = _drill_gate(self.layer_id, forward_batch)
+        if _inner_drill:
+            logger.error(
+                "DRILL layer_ids: self.layer_id=%s self.attn.layer_id=%s DRILL=%s",
+                self.layer_id, getattr(self.attn, "layer_id", "NA"), _DRILL_LAYER,
+            )
+            _dump_save("L3_q.pt", q)
+            _dump_save("L3_k.pt", k)
+            _dump_save("L3_v.pt", v)
+
         attn_output = self.attn(q, k, v, forward_batch)
+        if _inner_drill:
+            _dump_save("L3_sdpa_out.pt", attn_output)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
+        if _inner_drill:
+            _dump_save("L3_gated_out.pt", attn_output)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -3512,6 +3613,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # self_attention, skipping prepare_attn and qkv_proj. Falls back to the
         # standard prepare_attn path otherwise.
         fused_qkv = None
+        _do_drill = _drill_gate(self.layer_id, forward_batch)
+        if _do_drill:
+            _dump_save(
+                "L3_pre.pt",
+                hidden_states if residual is None else (hidden_states + residual),
+            )
         _m = hidden_states.shape[0] if hidden_states.dim() == 2 else 0
         with _lp("attn/qkv+attn", _m):
             if not forward_batch.forward_mode.is_idle():
@@ -3547,6 +3654,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                         forward_batch=forward_batch,
                     )
 
+        if _do_drill:
+            _dump_save("L3_attn_out.pt", hidden_states)
+            _dump_save(
+                "L3_attn_residual.pt",
+                residual if residual is not None else hidden_states,
+            )
+            _drill_state["done"] = True
+            logger.error("[DRILL] wrote layer-%d attention sub-op dump", self.layer_id)
         if _NAN_PROBE: _nan_probe(
             "full_attn_out",
             hidden_states,
@@ -3798,9 +3913,36 @@ class Qwen3_5ForCausalLM(nn.Module):
         if _NAN_PROBE:
             _nan_probe_new_forward()
             _nan_probe("embed_out", hidden_states, forward_batch=forward_batch)
+
+        # One-shot residual-stream dump (SGL_XPU_DUMP_ACTS=1). Gate on first
+        # extend/prefill forward, TP rank 0 (stream is replicated post-allreduce).
+        _do_dump = False
+        if _DUMP_ACTS and not _dump_state["done"] and _dump_armed():
+            try:
+                from sglang.srt.distributed import (
+                    get_tensor_model_parallel_rank as _tp_rank,
+                )
+                _is_rank0 = _tp_rank() == 0
+            except Exception:
+                _is_rank0 = True
+            _fm = getattr(forward_batch, "forward_mode", None)
+            _is_extend = bool(_fm is not None and _fm.is_extend())
+            if _is_rank0 and _is_extend:
+                _do_dump = True
+                # Model.forward is called with input_ids=None (ids live on the
+                # forward_batch); fall back to it so we capture the real tokens.
+                _ids = input_ids if input_ids is not None else getattr(
+                    forward_batch, "input_ids", None)
+                _dump_save("input_ids.pt", _ids)
+
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
+            if _do_dump:
+                _dump_save(
+                    f"layer_{layer_idx:02d}_in.pt",
+                    hidden_states if residual is None else (hidden_states + residual),
+                )
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -3843,12 +3985,24 @@ class Qwen3_5ForCausalLM(nn.Module):
                 }
             )
 
+        # Final residual stream (pre-norm), one-shot dump.
+        if _do_dump:
+            _dump_save(
+                "final_prenorm.pt",
+                hidden_states if residual is None else (hidden_states + residual),
+            )
+
         # Apply final normalization
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        if _do_dump:
+            _dump_save("final_postnorm.pt", hidden_states)
+            _dump_state["done"] = True
+            logger.error("[DUMP_ACTS] wrote residual-stream dump to %s", _DUMP_DIR)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
