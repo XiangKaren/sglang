@@ -28,6 +28,46 @@ if TYPE_CHECKING:
 from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size, merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+# Hand-written ESIMD attention kernels (llm-scaler). These are the same kernels
+# the downstream -hicache backend uses to reach >400 tok/s at head_dim=256; the
+# sgl-kernel FMHA calls below stay as the fallback when a kernel is unavailable
+# or a gate is off. All paths are env-gated so absence => FMHA, never a crash.
+#   - sglang_decode_attn: flat-NHD token-granular decode. It is the one proven
+#     correct for GQA ratio-8 / single-KV-head, which is our per-rank TP=2 geometry
+#     (16 q / 2 kv, tp=2 -> 8 q / 1 kv). eagle_page_attn_decode is numerically
+#     wrong for that config, so decode routes here.
+#   - esimd_sdpa_prefill_dpas: DPAS/XMX full-causal SDPA prefill. Paged, reads the
+#     full cached seqlen via page_table, so it is prefix-correct (unlike the broken
+#     paged FMHA extend kernel) and lets radix cache stay on.
+_sglang_decode_attn_fn = None
+_xpu_create_kv_indices_fn = None
+try:
+    from custom_esimd_kernels_sglang import sglang_decode_attn as _sglang_decode_attn_fn
+    from custom_esimd_kernels_sglang import (
+        xpu_create_kv_indices as _xpu_create_kv_indices_fn,
+    )
+except Exception:
+    _sglang_decode_attn_fn = None
+    _xpu_create_kv_indices_fn = None
+
+# Op namespace is custom_esimd_kernels_vllm (unchanged from the ported kernel).
+# Lazily resolved; gated by SGL_XPU_PREFILL_DPAS=1. Full-causal only, so it must
+# not be routed for sliding-window / cross-attention layers.
+_prefill_dpas_op = None
+_prefill_dpas_tried = False
+
+
+def _get_prefill_dpas_op():
+    global _prefill_dpas_op, _prefill_dpas_tried
+    if not _prefill_dpas_tried:
+        _prefill_dpas_tried = True
+        try:
+            import custom_esimd_kernels_sglang.custom_esimd_kernels_prefill_dpas  # noqa: F401 -- registers the op
+            _prefill_dpas_op = torch.ops.custom_esimd_kernels_vllm.esimd_sdpa_prefill_dpas
+        except Exception:
+            _prefill_dpas_op = None
+    return _prefill_dpas_op
+
 
 class XPUAttentionBackend(AttentionBackend):
     """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
@@ -117,6 +157,10 @@ class XPUAttentionBackend(AttentionBackend):
         if _os_ns.environ.get("SGL_XPU_ATTN_NUM_SPLITS"):
             self.num_splits = int(_os_ns.environ["SGL_XPU_ATTN_NUM_SPLITS"])
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+
+        # Grow-only scratch for the ESIMD sglang_decode_attn eager path, reused
+        # across decode steps (no per-step alloc). Sized on first use.
+        self._sglang_decode_eager_scratch = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -620,7 +664,36 @@ class XPUAttentionBackend(AttentionBackend):
                         _use_varlen = False
                 except Exception:
                     _use_varlen = False
-            if _use_varlen:
+
+            # ESIMD DPAS prefill (the downstream >400 tok/s path). Full-causal
+            # only and paged: it attends the full cached seqlen via page_table, so
+            # unlike the broken paged FMHA extend it is prefix-correct and needs
+            # neither SGL_XPU_EXTEND_VARLEN nor --disable-radix-cache. Preferred
+            # over varlen when its gate is on; varlen/FMHA remain the fallback.
+            _dpas = (
+                _get_prefill_dpas_op()
+                if (
+                    _os_ns.environ.get("SGL_XPU_PREFILL_DPAS") == "1"
+                    and q.dtype == torch.float16
+                    and layer.head_dim == 256
+                    and not layer.is_cross_attention
+                    and not use_cascade_attn
+                    and not is_hybrid_swa
+                )
+                else None
+            )
+            if _dpas is not None:
+                result = _dpas(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache,
+                    value_cache,
+                    cu_seqlens_q.to(torch.int32),
+                    cache_seqlens.to(torch.int32),
+                    causal,
+                    float(layer.scaling),
+                    page_table.to(torch.int32),
+                )
+            elif _use_varlen:
                 result = flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
@@ -992,6 +1065,28 @@ class XPUAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+                import os as _os_ns
+
+                # ESIMD flat-NHD decode (the downstream >400 tok/s path). Proven
+                # correct for GQA ratio-8 / single-KV-head (our per-rank TP=2
+                # geometry); eagle_page_attn_decode is numerically wrong there.
+                # Token-granular, so it reads the flat kv pool via kv_indptr/
+                # kv_indices rather than the paged page_table. Fallback = FMHA.
+                _use_sglang_decode = (
+                    _sglang_decode_attn_fn is not None
+                    and not use_cascade_attn
+                    and not is_swa_layer
+                    and layer.head_dim == 256
+                    and layer.tp_q_head_num % layer.tp_k_head_num == 0
+                    and q_reshaped.dtype == torch.float16
+                    and _os_ns.environ.get("SGL_XPU_DECODE_SGLANG_ATTN", "1") == "1"
+                )
+                if _use_sglang_decode:
+                    o = self._sglang_decode_attn(
+                        layer, q_reshaped, forward_batch, metadata
+                    )
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
@@ -1074,6 +1169,106 @@ class XPUAttentionBackend(AttentionBackend):
 
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return out
+
+    def _sglang_decode_attn(self, layer, q_reshaped, forward_batch, metadata):
+        """ESIMD flat-NHD token-granular decode (custom_esimd_kernels_sglang).
+
+        The proven-correct decode kernel for GQA ratio-8 / single-KV-head (see
+        the gate in forward_decode). Reads the flat kv pool via token-granular
+        kv_indptr/kv_indices, not the paged page_table. Returns o shaped
+        (batch, tp_q_head_num, head_dim).
+        """
+        bs = forward_batch.batch_size
+        k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buf = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        q_fp16 = q_reshaped.view(bs, layer.tp_q_head_num, layer.head_dim)
+        if q_fp16.dtype != torch.float16:
+            q_fp16 = q_fp16.to(torch.float16)
+        if k_buf.dtype != torch.float16:
+            k_buf = k_buf.to(torch.float16)
+            v_buf = v_buf.to(torch.float16)
+        o_fp16 = torch.empty_like(q_fp16)
+        kv_indptr, kv_indices, temp_p, graph_max_seq = (
+            self._build_sglang_decode_attn_inputs_eager(
+                forward_batch, metadata, layer.tp_q_head_num, layer.head_dim
+            )
+        )
+        _sglang_decode_attn_fn(
+            q_fp16,
+            k_buf,
+            v_buf,
+            kv_indptr,
+            kv_indices,
+            o_fp16,
+            float(layer.scaling),
+            temp_p,
+            graph_max_seq,
+        )
+        return o_fp16.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+    def _build_sglang_decode_attn_inputs_eager(
+        self, forward_batch, metadata, tp_q_head_num, head_dim
+    ):
+        """Build flat-NHD kv_indptr/kv_indices/temp_p for sglang_decode_attn on
+        the eager decode path (XPU graphs off; full attention only, no SWA on
+        this model). Scratch is grow-only and reused across steps; the built
+        inputs are batch-level and layer-invariant, so they are memoized on the
+        per-step metadata and reused by every full-attention layer. Over-sizing
+        kv_indices is safe -- the kernel only reads the kv_indptr-delimited
+        ranges."""
+        bs = forward_batch.batch_size
+        cached = metadata.xpu_esimd_decode_inputs
+        if cached is not None and cached[0].numel() == bs + 1:
+            return cached
+
+        device = metadata.cache_seqlens_int32.device
+        # Split kernel geometry: 64-token tiles x 256 splits => 16384 max seq.
+        _SPLIT_TILE = 64
+        _MAX_N_SPLITS = 256
+        graph_max_seq = _SPLIT_TILE * _MAX_N_SPLITS
+
+        max_seq_len_k = metadata.max_seq_len_k
+        if not isinstance(max_seq_len_k, int) or max_seq_len_k <= 0:
+            max_seq_len_k = self.max_context_len
+        # Upper bound on total kv entries this step: sum(seq_lens) <= bs * max_seq_len_k.
+        need_kv = max(bs * max_seq_len_k, 1)
+        need_temp = max(bs * tp_q_head_num * _MAX_N_SPLITS * (1 + 1 + 256), 1)
+
+        cache = self._sglang_decode_eager_scratch
+        if (
+            cache is None
+            or cache["kv_indptr"].numel() < bs + 1
+            or cache["kv_indices"].numel() < need_kv
+            or cache["temp_p"].numel() < need_temp
+        ):
+            cache = {
+                "kv_indptr": torch.zeros(
+                    max(bs + 1, 1), dtype=torch.int32, device=device
+                ),
+                "kv_indices": torch.empty(need_kv, dtype=torch.int32, device=device),
+                "temp_p": torch.empty(need_temp, dtype=torch.float32, device=device),
+            }
+            self._sglang_decode_eager_scratch = cache
+
+        kv_indptr = cache["kv_indptr"][: bs + 1]
+        kv_indices = cache["kv_indices"]
+        temp_p = cache["temp_p"]
+
+        seqlens = metadata.cache_seqlens_int32
+        kv_indptr[0] = 0
+        torch.cumsum(seqlens, dim=0, dtype=torch.int32, out=kv_indptr[1:])
+        _xpu_create_kv_indices_fn(
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            seqlens,
+            kv_indptr,
+            None,
+            kv_indices,
+            max_seq_len_k,
+        )
+        result = (kv_indptr, kv_indices, temp_p, graph_max_seq)
+        metadata.xpu_esimd_decode_inputs = result
+        return result
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""

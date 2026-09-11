@@ -122,6 +122,11 @@ class FlashAttentionMetadata:
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
+    # Per-step memo for the XPU ESIMD sglang_decode_attn inputs
+    # (kv_indptr, kv_indices, temp_p, graph_max_seq). Built once by the first
+    # full-attention layer and reused by the rest; batch-level, layer-invariant.
+    xpu_esimd_decode_inputs: Optional[tuple] = None
+
 
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
