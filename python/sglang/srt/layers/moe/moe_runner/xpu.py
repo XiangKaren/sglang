@@ -50,6 +50,33 @@ _MOE_PREFILL_COMPARE = os.environ.get("SGL_XPU_MOE_PREFILL_COMPARE", "0") == "1"
 _MOE_PREFILL_USE_TRITON = os.environ.get("SGL_XPU_MOE_PREFILL_USE_TRITON", "0") == "1"
 _CMP_MAX_M = int(os.environ.get("SGL_XPU_MOE_PREFILL_CMP_MAX_M", "256"))
 
+# WIRE P8 diag: one-shot log of the tier-2 (ESIMD fp8 MoE prefill) decision
+# inputs. The path is fully wired and the gate is on, yet serve logs still show
+# the Triton fused_moe fallback firing (see reports/pipeline-architecture-diff.md
+# gap B) with NO kernel-failure warning -> a guard is declining silently. This
+# logs the guard state on the first prefill-tier call so the log names the cause.
+_P8_DIAG_DONE = False
+
+# WIRE decode-drill: one-shot per (M-bucket, tier) log of WHICH MoE runner tier
+# actually executes, so the orig-vs-rebase wiring table is proven from logs, not
+# assumed. M<=8 is the decode regime; the fp8 variant (e4m3/e5m2) names the exact
+# decode kernel (orig ships e5m2, rebase locked e4m3 -> different .so entry).
+_MOE_TIER_DIAG_SEEN = set()
+
+
+def _moe_tier_diag(m, tier, quant_info):
+    try:
+        wdt = getattr(getattr(quant_info, "w13_weight", None), "dtype", None)
+        variant = "e5m2" if wdt == torch.float8_e5m2 else ("e4m3" if wdt == torch.float8_e4m3fn else str(wdt))
+        regime = "decode" if m <= 8 else "prefill"
+        key = (regime, tier, variant)
+        if key not in _MOE_TIER_DIAG_SEEN:
+            _MOE_TIER_DIAG_SEEN.add(key)
+            logger.warning("[MOE-tier-diag] regime=%s M=%d TIER=%s wdtype=%s fp8=%s",
+                           regime, m, tier, variant, getattr(quant_info, "use_fp8_w8a8", None))
+    except Exception:
+        pass
+
 
 @functools.cache
 def _load_esimd_moe_prefill_op():
@@ -205,6 +232,12 @@ class XpuRunnerCore(MoeRunnerCore):
             if cached is not None:
                 return cached
             s = scale.to(torch.float32).reshape(scale.shape[0], -1).mean(dim=-1)
+            # e4m3-lock guard (decode twin of _f32c's): a 0/NaN/inf per-expert
+            # scale (empty/padded expert -> amax 0, or an upstream requantize
+            # that overflowed the e4m3 448 range) would feed the DPAS dequant a
+            # poison multiplier -> NaN output -> garbage token ids -> the ungated
+            # (values>=0) invariant assert. No-op on valid positive scales.
+            s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(1e-12)
             s = s.contiguous()
             try:
                 scale._xpu_pt_per_expert = s
@@ -260,6 +293,34 @@ class XpuRunnerCore(MoeRunnerCore):
 
         Returns the routed MoE output [T, hidden], or None to fall through.
         """
+        global _P8_DIAG_DONE
+        if not _P8_DIAG_DONE:
+            _P8_DIAG_DONE = True
+            try:
+                _w13 = getattr(quant_info, "w13_weight", None)
+                _w2 = getattr(quant_info, "w2_weight", None)
+                logger.warning(
+                    "[P8-diag] esimd_prefill entry: T=%s gate=%s fp8=%s act=%s "
+                    "gemm1_alpha=%s clamp=%s swiglu=%s bias=%s w13.dtype=%s "
+                    "w2.dtype=%s w13_scale=%s w2_scale=%s block_shape=%s op=%s",
+                    tuple(getattr(runner_input.hidden_states, "shape", ()) or ()),
+                    _ESIMD_MOE_PREFILL,
+                    quant_info.use_fp8_w8a8,
+                    self.config.activation,
+                    self.config.gemm1_alpha,
+                    self.config.gemm1_clamp_limit,
+                    self.config.swiglu_limit,
+                    (quant_info.b13 is not None or quant_info.b2 is not None),
+                    getattr(_w13, "dtype", None),
+                    getattr(_w2, "dtype", None),
+                    quant_info.w13_scale is not None,
+                    quant_info.w2_scale is not None,
+                    quant_info.block_shape,
+                    _load_esimd_moe_prefill_op() is not None,
+                )
+            except Exception as _e:
+                logger.warning("[P8-diag] failed: %s", _e)
+
         if not _ESIMD_MOE_PREFILL:
             return None
         if not quant_info.use_fp8_w8a8:
@@ -311,6 +372,14 @@ class XpuRunnerCore(MoeRunnerCore):
                     return None
             else:
                 s = s.mean(dim=-1)  # [E]
+            # e4m3-lock guard: a 0/NaN/inf per-expert scale (an empty/padded
+            # expert whose amax collapsed to 0, or an upstream requantize that
+            # overflowed the e4m3 448 range) would feed the DPAS dequant a poison
+            # multiplier -> NaN in the routed MoE output -> garbage token ids ->
+            # the ungated (values>=0) invariant assert ("input_[0] != 0"). No-op
+            # on valid positive scales; an empty expert contributes ~0 anyway
+            # (its topk weight is ~0), so clamping its dead scale changes nothing.
+            s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(1e-12)
             s = s.contiguous()
             try:
                 setattr(scale, key, s)
@@ -465,8 +534,10 @@ class XpuRunnerCore(MoeRunnerCore):
         hooks: Optional[Any] = None,
     ) -> XpuRunnerOutput:
         # Tier 1: ESIMD fp8 silu DECODE (M=1 DPAS, gated T<=8).
+        _M = int(runner_input.hidden_states.shape[0])
         out = self._try_esimd_fp8_silu(runner_input, quant_info)
         if out is not None:
+            _moe_tier_diag(_M, "tier1_esimd_decode", quant_info)
             return XpuRunnerOutput(hidden_states=out)
 
         # Tier 2: ESIMD fp8 silu PREFILL (M-tiled DPAS, T>8). The ONLY fp8-capable
@@ -502,6 +573,7 @@ class XpuRunnerCore(MoeRunnerCore):
                         return XpuRunnerOutput(hidden_states=tri)
                 except Exception as e:
                     logger.warning("[MOE_PREFILL_CMP] triton compare failed: %s", e)
+            _moe_tier_diag(_M, "tier2_esimd_prefill", quant_info)
             return XpuRunnerOutput(hidden_states=out)
 
         # Tier 3: native sgl-kernel SYCL (downstream parity) for NON-fp8 MoE,
@@ -511,8 +583,10 @@ class XpuRunnerCore(MoeRunnerCore):
         # (prefill op unavailable/declined) falls through to triton as a last try.
         out = self._run_sgl_native(runner_input, quant_info)
         if out is not None:
+            _moe_tier_diag(_M, "tier3_sgl_native", quant_info)
             return XpuRunnerOutput(hidden_states=out)
 
+        _moe_tier_diag(_M, "tier4_triton", quant_info)
         out = self._run_triton_fallback(runner_input, quant_info, running_state, hooks)
         return XpuRunnerOutput(hidden_states=out)
 
