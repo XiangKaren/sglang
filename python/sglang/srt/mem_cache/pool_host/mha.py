@@ -60,6 +60,18 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
     )
+if _is_xpu:
+    from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer,
+        transfer_kv_all_layer_lf_pf,
+        transfer_kv_all_layer_lf_ph,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_per_layer,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+        transfer_kv_per_layer_pf_lf,
+        transfer_kv_per_layer_ph_lf,
+    )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 

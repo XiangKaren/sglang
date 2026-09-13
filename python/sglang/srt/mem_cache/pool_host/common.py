@@ -256,5 +256,6 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        "xpu": alloc_with_pin_memory,  # XPU: pin_memory=True works, no CUDA host register
     },
 )
