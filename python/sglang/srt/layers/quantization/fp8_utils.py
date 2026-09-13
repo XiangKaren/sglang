@@ -61,6 +61,68 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
 
+# ---------------------------------------------------------------------------
+# WIRE P0 (PORT): XPU fp8 dense-GEMM ESIMD dispatch.
+# The rebase reset this file to upstream and dropped the entire XPU fp8 fast
+# path, so every fp8 linear (decode + prefill) fell back to torch._scaled_mm /
+# triton_scaled_mm (see reports/pipeline-architecture-diff.md, gap A). Ported
+# from the downstream orig; kernels ship in custom_esimd_kernels_sglang (present
+# in the xpu-0518 env). Guarded so non-XPU / missing-kernel builds are unaffected.
+# ---------------------------------------------------------------------------
+import os as _os  # local: fp8_utils does not otherwise import os
+
+# opt#1: per-tensor (not per-token) prefill activation quant so torch._scaled_mm
+# uses its FUSED dequant epilogue instead of the unfused fp32 dequant (~17% of
+# prefill). Decode (M<=64) is untouched (it early-returns via the ESIMD path).
+_XPU_FP8_PERTENSOR_PREFILL = _is_xpu and get_bool_env_var(
+    "SGLANG_XPU_FP8_PERTENSOR_PREFILL", "true"
+)
+if _is_xpu:
+    logger.info(
+        "[opt#1] XPU FP8 per-tensor prefill dequant fusion = %s",
+        "ON" if _XPU_FP8_PERTENSOR_PREFILL else "OFF",
+    )
+
+# opt#2 (W8A16): XPU prefill keeps the activation in fp16 (NO activation quant)
+# and runs a mixed f16 x f8 oneDNN matmul (onednn_fp8_gemm_w8a16). Supersedes
+# opt#1 and is checked first in apply_fp8_linear. SGLANG_XPU_FP8_W8A16_PREFILL=0
+# to disable and revert to opt#1.
+_XPU_FP8_W8A16_PREFILL = _is_xpu and get_bool_env_var(
+    "SGLANG_XPU_FP8_W8A16_PREFILL", "true"
+)
+_fp8_gemm_w8a16 = None
+if _is_xpu and _XPU_FP8_W8A16_PREFILL:
+    try:
+        from custom_esimd_kernels_sglang import (
+            onednn_fp8_gemm_w8a16 as _fp8_gemm_w8a16,
+        )
+
+        logger.info(
+            "[opt#2] XPU FP8 W8A16 prefill = ON (custom_esimd_kernels_sglang)"
+        )
+    except Exception as _e_pkg:  # pragma: no cover - env without the kernel pkg
+        logger.warning(
+            "[opt#2] W8A16 requested but custom_esimd_kernels_sglang "
+            "unavailable (%s); falling back to opt#1",
+            _e_pkg,
+        )
+        _fp8_gemm_w8a16 = None
+
+# Weight-only ESIMD GEMM for decode / small-M / narrow-N (per-tensor weight).
+# The op auto-selects GEMV (M<=3) vs DPAS internally. Narrow-N GEMMs take this
+# path at any M because torch._scaled_mm is not reproducible on narrow-N shapes
+# (its K-split reduction order varies with occupancy -> nondeterministic).
+_XPU_ESIMD_FP8_NARROW_N = int(_os.environ.get("SGL_XPU_ESIMD_FP8_NARROW_N", "128"))
+_P0_DIAG_SEEN = set()  # one-shot keys for [P0-diag] path-selection logs
+_esimd_gemm_fp8_pert = None
+if _is_xpu:
+    try:
+        from custom_esimd_kernels_sglang import (
+            esimd_gemm_fp8_pert as _esimd_gemm_fp8_pert,
+        )
+    except Exception:
+        _esimd_gemm_fp8_pert = None
+
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
 # pure-triton block-fp8 path on gfx1250.
@@ -1826,6 +1888,96 @@ def apply_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
+    # WIRE P0 (PORT): XPU ESIMD fp8 fast paths, ported from downstream orig.
+    # (1) decode / small-M / narrow-N weight-only early return via
+    #     esimd_gemm_fp8_pert; (2) opt#2 W8A16 oneDNN prefill. Both fire only for
+    #     per-tensor weight, non-compressed, fp16/bf16 activation (the rebase-only
+    #     prequantized-fp8 activation case is excluded -> falls through to generic).
+    #     See reports/pipeline-architecture-diff.md gap A.
+    _n_out = weight.shape[1]
+    _act_is_fp8 = input_2d.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if (
+        _is_xpu
+        and _esimd_gemm_fp8_pert is not None
+        and not _act_is_fp8
+        and not compressed_tensor_quant
+        and not (cutlass_fp8_supported and weight_scale.numel() == weight.shape[1])
+        and (weight_scale.numel() == 1)
+        and bias is None
+        and (input_2d.shape[0] <= 64 or _n_out <= _XPU_ESIMD_FP8_NARROW_N)
+    ):
+        weight_nk = getattr(weight, "_esimd_t", None)
+        if weight_nk is None:
+            weight_nk = weight.t().contiguous()
+            try:
+                weight._esimd_t = weight_nk
+            except Exception:
+                pass
+        scale_1d = getattr(weight_scale, "_esimd_1d", None)
+        if scale_1d is None:
+            scale_1d = weight_scale.to(torch.float32).reshape(-1)[:1].contiguous()
+            try:
+                weight_scale._esimd_1d = scale_1d
+            except Exception:
+                pass
+        input_fp16 = (
+            input_2d
+            if input_2d.dtype == torch.float16
+            else input_2d.to(torch.float16)
+        )
+        M = input_fp16.shape[0]
+        N = weight_nk.shape[0]
+        output = torch.empty(M, N, dtype=torch.float16, device=input_2d.device)
+        _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_1d, output)
+        # WIRE P0-diag (one-shot per distinct M): confirms the ESIMD dense fp8
+        # path fires for decode and shows whether it is a GEMM on small M (where
+        # a GEMV would be faster).
+        _k = ("gemm", int(M))
+        if _k not in _P0_DIAG_SEEN:
+            _P0_DIAG_SEEN.add(_k)
+            logger.warning("[P0-diag] ESIMD dense fp8 GEMM path M=%d N=%d n_out=%d", M, N, _n_out)
+        out = output if output.dtype == input.dtype else output.to(input.dtype)
+        return out.view(*output_shape)
+
+    if (
+        _is_xpu
+        and _fp8_gemm_w8a16 is not None
+        and not _act_is_fp8
+        and not compressed_tensor_quant
+        and weight_scale.numel() == 1
+        and input_2d.shape[0] > 64
+    ):
+        x_fp16 = (
+            input_2d
+            if input_2d.dtype == torch.float16
+            else input_2d.to(torch.float16)
+        )
+        output = _fp8_gemm_w8a16(x_fp16, weight, weight_scale, bias)
+        return output.to(input.dtype).view(*output_shape)
+
+    # WIRE P0-diag (one-shot): an XPU fp8 linear that did NOT take either ESIMD
+    # fast path and is about to run generic CUTLASS/triton/torch._scaled_mm.
+    # Records WHY, so we can tell if decode dense GEMMs are silently generic.
+    if _is_xpu:
+        _m = int(input_2d.shape[0])
+        _reason = (
+            "act_fp8" if _act_is_fp8
+            else "esimd_op_none" if _esimd_gemm_fp8_pert is None
+            else "scale_numel=%d" % int(weight_scale.numel())
+            if weight_scale.numel() != 1
+            else "compressed" if compressed_tensor_quant
+            else "cutlass_chan" if (cutlass_fp8_supported and weight_scale.numel() == weight.shape[1])
+            else "bias" if bias is not None
+            else "other"
+        )
+        _k = ("fallthru", _m, _reason)
+        if _k not in _P0_DIAG_SEEN:
+            _P0_DIAG_SEEN.add(_k)
+            logger.warning(
+                "[P0-diag] GENERIC fp8 path (no ESIMD) M=%d n_out=%d reason=%s act=%s",
+                _m, int(weight.shape[1]), _reason, str(input_2d.dtype),
+            )
+
     # A pre-quantized fp8 activation (e.g. from a fused RMSNorm+quant kernel)
     # carries no original dtype: skip re-quant, reuse the supplied per-tensor
     # input_scale, and emit ``pre_quant_output_dtype`` (the model's activation
@@ -1925,6 +2077,15 @@ def apply_fp8_linear(
                         input_2d,
                         input_scale,
                         use_per_token_if_dynamic=use_per_token_if_dynamic,
+                    )
+                elif _XPU_FP8_PERTENSOR_PREFILL and weight_scale.numel() == 1:
+                    # WIRE P0 (PORT): opt#1 XPU prefill per-tensor activation quant
+                    # -> fused torch._scaled_mm epilogue (decode M<=64 already
+                    # returned via the ESIMD fast path above).
+                    qinput, x_scale = scaled_fp8_quant(
+                        input_2d,
+                        input_scale,
+                        use_per_token_if_dynamic=False,
                     )
                 else:
                     qinput, x_scale = per_token_group_quant_fp8(
