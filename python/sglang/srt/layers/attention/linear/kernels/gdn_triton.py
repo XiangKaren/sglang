@@ -215,14 +215,39 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # Returns (out [1, T, H_v, V], last_state [n_seqs, H_v, V, K]).
             # g is fp32 log-space decay; kernel expects exactly that.
             # initial_state is IN/OUT: kernel mutates it to last_state.
-            state_in = recurrent_state.contiguous()
-            out, last_state = torch.ops.eagle_ops.chunk_gated_delta_rule_extend(
+            # hazard4 fix: the ESIMD kernel asserts initial_state.size(0)==n_seqs,
+            # but on the default contiguous pool the rebase feeds `extend` the FULL
+            # [num_slots,...] pool (the XPU state-gather at the top of this method
+            # was reduced to NPU-only in the rebase). Gather the per-sequence slice
+            # here so the kernel sees [n_seqs, H_v, V, K]. `ssm_states`/`cache_indices`
+            # are the params passed by gdn_backend: for the contiguous pool they are
+            # the real pool + raw indices; for the strided-envelope pool they are the
+            # gathered contig copy + identity arange -- indexing is correct in both.
+            state_in = ssm_states[cache_indices].contiguous()
+            if not getattr(TritonGDNKernel, "_P4_DIAG_DONE", False):
+                TritonGDNKernel._P4_DIAG_DONE = True
+                print(
+                    f"[P4-diag] GDN ESIMD extend FIRED: q={tuple(q.shape)} "
+                    f"v={tuple(v.shape)} ssm_pool={tuple(ssm_states.shape)} "
+                    f"cache_idx={tuple(cache_indices.shape)} "
+                    f"state_in={tuple(state_in.shape)} dtype={state_in.dtype}",
+                    flush=True,
+                )
+            out, last_state, _ = torch.ops.eagle_ops.chunk_gated_delta_rule_extend(
                 q.contiguous(), k.contiguous(), v.contiguous(),
                 g.contiguous(), beta.contiguous(),
                 state_in, query_start_loc.to(torch.int32).contiguous(),
                 scale,
             )
-            # Match chunk_gated_delta_rule_torch return: (o, last_recurrent_state, h_aux)
+            # Commit the new per-sequence state. Unlike the Triton fallback (which
+            # mutates the pool in place via initial_state_indices), the ESIMD op
+            # returns a fresh gathered state, so write it back at the same indices.
+            # Contiguous pool: commits straight to the pool. Strided-envelope pool:
+            # updates the contig copy, which gdn_backend scatters back later.
+            ssm_states[cache_indices] = last_state.to(ssm_states.dtype, copy=False)
+            # The 3rd kernel return (per-chunk h) is only meaningful with
+            # h_chunk_size>0 (non-chunk-aligned track snapshots); this call uses the
+            # schema default 0, so match the rebase contract and return None here.
             return out, last_state, None
 
         return chunk_gated_delta_rule(
