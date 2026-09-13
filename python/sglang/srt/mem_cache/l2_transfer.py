@@ -6,10 +6,11 @@ from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+_is_xpu = is_xpu()
 
 
 @cache
@@ -60,6 +61,11 @@ class L2TransferEngine:
         with device_module.stream(self.device_to_host_stream):
             start_event.wait(self.device_to_host_stream)
             ack_start.record()
+            # XPU: the mamba host backup issues synchronous blitter copies; bracket it with
+            # device/stream syncs so the compute stream's writes are visible before the copy
+            # and the copies fully drain after, preventing the BCS watchdog DEVICE_LOST.
+            if _is_xpu:
+                torch.xpu.synchronize()
             for transfer in transfers:
                 transfer.host_pool.backup_from_device_all_layer(
                     transfer.device_pool,
@@ -67,6 +73,8 @@ class L2TransferEngine:
                     transfer.device_indices,
                     self.io_backend,
                 )
+            if _is_xpu:
+                self.device_to_host_stream.synchronize()
             ack_finish.record()
             self._record_stream(transfers, self.device_to_host_stream)
         return TransferCompletion(ack_start, ack_finish, timing_enabled)

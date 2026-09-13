@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 from typing import Optional
 
@@ -34,11 +36,28 @@ if _is_cuda or _is_hip or _is_xpu:
     )
 if _is_cuda or _is_hip:
     # io_backend="kernel" mamba transfer is a CUDA-only JIT kernel (transfer_mamba.cuh);
-    # it has no XPU implementation, so it is NOT imported on XPU. XPU runs "direct".
+    # it has no XPU implementation, so it is NOT imported on XPU. On XPU the tiered
+    # dispatch below routes every mamba transfer to the Tier-2 SYCL kernel or the Tier-3
+    # synchronous fallback, so these symbols are never referenced there.
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
+
+# Tier-2 SYCL Mamba-state kernel for medium-large states (64 KB - 16 MB). It lives in the
+# sgl-kernel-xpu source (@9572792) but is only exposed once that build is installed. Probe it
+# so Tier-2 auto-activates after a rebuild with no further Python change, and safely falls
+# through to the Tier-3 synchronous copy until then (the installed .so may lack the op even
+# when the Python wrapper imports, so also verify the registered torch op).
+try:
+    from sgl_kernel.kvcacheio import transfer_mamba_state as _transfer_mamba_state
+
+    _HAS_MAMBA_STATE_KERNEL = hasattr(torch.ops.sgl_kernel, "transfer_mamba_state")
+    if not _HAS_MAMBA_STATE_KERNEL:
+        _transfer_mamba_state = None
+except (ImportError, AttributeError):
+    _transfer_mamba_state = None
+    _HAS_MAMBA_STATE_KERNEL = False
 
 logger = logging.getLogger(__name__)
 
@@ -291,11 +310,46 @@ class MambaPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    # --- Tiered Mamba-state transfer dispatch (BMG/XPU DEVICE_LOST mitigation) ---
+    # Large Mamba states (768 KB - 3 MB per token) copied non-blocking overflow the BMG BCS
+    # (blitter) engine watchdog before the first synchronize() returns -> DEVICE_LOST. Dispatch
+    # by per-index byte size: Tier 1 (<=64 KB) uses the batched transfer_kv_per_layer_mla
+    # kernel; Tier 2 (64 KB - 16 MB) uses the transfer_mamba_state SYCL kernel (work-group
+    # cooperative copy, no BCS DMA) when the rebuilt sgl-kernel exposes it; Tier 3 (>16 MB, or
+    # whenever the SYCL kernel is unavailable) copies synchronously with a periodic queue drain.
+    TIER1_LIMIT = 65536  # 64 KB — safe ceiling for transfer_kv_per_layer_mla
+    TIER2_LIMIT = 16777216  # 16 MB — transfer_mamba_state SYCL kernel ceiling (needs rebuild)
+    KERNEL_ITEM_SIZE_LIMIT = TIER1_LIMIT  # backwards-compat alias
+
     @staticmethod
     def _item_size_per_index(tensor: torch.Tensor) -> int:
         if tensor.shape[0] == 0:
             return 0
         return int(tensor[0].numel() * tensor.element_size())
+
+    @staticmethod
+    def _sync_copy_indices(src_indices, dst_indices, item_size, copy_one, tag) -> None:
+        """Tier-3 DEVICE_LOST-safe fallback: synchronous per-index copy with a periodic
+        blitter-queue drain. ``copy_one(si, di)`` performs one synchronous
+        ``copy_(..., non_blocking=False)``; we drain roughly every 32 MB to bound the BCS
+        queue depth without paying a synchronize per token."""
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        SYNC_TARGET_BYTES = 32 * 1024 * 1024  # 32 MB
+        sync_batch = max(1, SYNC_TARGET_BYTES // max(1, item_size))
+        if _debug:
+            print(
+                f"[MAMBA_COPY_FALLBACK] {tag} item_size={item_size}, "
+                f"n={src_indices.numel()}, sync every {sync_batch} tokens",
+                file=sys.stderr,
+                flush=True,
+            )
+        _xpu = getattr(torch, "xpu", None)
+        src_idx_cpu = src_indices.cpu().tolist()
+        dst_idx_cpu = dst_indices.cpu().tolist()
+        for i, (si, di) in enumerate(zip(src_idx_cpu, dst_idx_cpu)):
+            copy_one(si, di)
+            if (i + 1) % sync_batch == 0 and _xpu is not None and hasattr(_xpu, "synchronize"):
+                _xpu.synchronize()  # drain the blitter queue to avoid the watchdog
 
     @staticmethod
     def _copy_tensor(
@@ -307,6 +361,38 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
+        item_size = MambaPoolHost._item_size_per_index(src)
+
+        # Tiered dispatch for large Mamba states (see class-level note).
+        if item_size > MambaPoolHost.TIER1_LIMIT:
+            if item_size <= MambaPoolHost.TIER2_LIMIT and _HAS_MAMBA_STATE_KERNEL:
+                try:
+                    if os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1":
+                        print(
+                            f"[MAMBA_COPY_TIER2] item_size={item_size}, "
+                            f"n={src_indices.numel()}, using transfer_mamba_state kernel",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    _transfer_mamba_state(
+                        src=src,
+                        dst=dst,
+                        src_indices=src_indices,
+                        dst_indices=dst_indices,
+                        item_size=item_size,
+                    )
+                    return
+                except (ImportError, AttributeError, RuntimeError, NotImplementedError):
+                    pass  # fall through to the Tier-3 synchronous fallback
+            MambaPoolHost._sync_copy_indices(
+                src_indices,
+                dst_indices,
+                item_size,
+                lambda si, di: dst[di].copy_(src[si], non_blocking=False),
+                tag="copy_tensor",
+            )
+            return
+
         if io_backend == "kernel":
             # TODO: Rename the interface for clarity.
             # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
@@ -316,7 +402,7 @@ class MambaPoolHost(HostKVCache):
                 dst=dst,
                 src_indices=src_indices,
                 dst_indices=dst_indices,
-                item_size=MambaPoolHost._item_size_per_index(src),
+                item_size=item_size,
             )
         elif io_backend == "direct":
             transfer_kv_direct(
@@ -341,8 +427,20 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
+        item_size = MambaPoolHost._item_size_per_index(dst)
+        # XPU never imports the CUDA-JIT transfer_kv_mamba_pf_lf, and large states are unsafe
+        # for the non-blocking kernel path anyway. Copy synchronously (page-first host slot
+        # [page, layer, 0] -> device layer slot) with a periodic blitter-queue drain.
+        if _is_xpu or item_size > MambaPoolHost.KERNEL_ITEM_SIZE_LIMIT:
+            MambaPoolHost._sync_copy_indices(
+                src_indices,
+                dst_indices,
+                item_size,
+                lambda si, di: dst[di].copy_(src[si, layer_id, 0], non_blocking=False),
+                tag="pf_lf",
+            )
+            return
         if io_backend == "kernel":
-            item_size = MambaPoolHost._item_size_per_index(dst)
             # Mamba JIT kernel expects all index tensors on CUDA.
             # host_indices may be on CPU (kept there by start_writing when
             # can_use_write_back_jit is True on the HostPoolGroup).
@@ -383,8 +481,40 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
+        item_size = MambaPoolHost._item_size_per_index(src_layers[0])
+        # XPU never imports the CUDA-JIT transfer_kv_mamba_lf_pf; large states are unsafe for
+        # the non-blocking kernel path anyway. Copy synchronously (device layer slot ->
+        # page-first host slot [page, layer, 0]), draining the blitter queue ~every 32 MB
+        # across the whole (layer, index) loop so the BCS watchdog never fires -> no DEVICE_LOST.
+        if _is_xpu or item_size > MambaPoolHost.KERNEL_ITEM_SIZE_LIMIT:
+            _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+            SYNC_TARGET_BYTES = 32 * 1024 * 1024  # 32 MB
+            sync_batch = max(1, SYNC_TARGET_BYTES // max(1, item_size))
+            if _debug:
+                print(
+                    f"[MAMBA_COPY_FALLBACK] all_layers_lf_pf item_size={item_size}, "
+                    f"n={src_indices.numel()}, layers={num_layers}, "
+                    f"sync every {sync_batch} copies",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            _xpu = getattr(torch, "xpu", None)
+            src_idx_cpu = src_indices.cpu().tolist()
+            dst_idx_cpu = dst_indices.cpu().tolist()
+            count = 0
+            for lid in range(num_layers):
+                src_layer = src_layers[lid]
+                for si, di in zip(src_idx_cpu, dst_idx_cpu):
+                    dst[di, lid, 0].copy_(src_layer[si], non_blocking=False)
+                    count += 1
+                    if (
+                        count % sync_batch == 0
+                        and _xpu is not None
+                        and hasattr(_xpu, "synchronize")
+                    ):
+                        _xpu.synchronize()
+            return
         if io_backend == "kernel":
-            item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             # Mamba JIT kernel expects all index tensors on CUDA.
             # When can_use_write_back_jit is True on the HostPoolGroup,
             # start_writing() keeps host_indices on CPU (for MLA staged kernel).
