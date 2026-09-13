@@ -1390,6 +1390,23 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 else:
                     free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
+            # WIRE P14 (framework regression fix): the compacting MultiEndedAllocator
+            # asserts every survivor move-src round-trips p2v->v2p. A stale free
+            # (v2p already -1) or an aliased free (p2v[p] rebound to another live
+            # virtual by the mamba ping-pong donate/keep dance under extra_buffer +
+            # mamba radix cache) would enroll a "ghost-free" page into
+            # _free_phys_pages that p2v still marks live -> the page is double-booked
+            # (handed to a new virtual while the old one still reads it) and the next
+            # urgent _flush picks it as a move src and SIGABRTs in _commit_move_batch.
+            # Enroll only pages whose mapping still round-trips. The .all() reduction
+            # is a small-tensor read on the per-finished-request mamba free set (not a
+            # per-token path); the reindex runs only on the rare inconsistent free.
+            _rt_valid = (freed_p_pages >= 0) & (
+                self.physical_to_virtual[freed_p_pages] == free_v_pages
+            )
+            if not bool(_rt_valid.all()):
+                free_v_pages = free_v_pages[_rt_valid]
+                freed_p_pages = freed_p_pages[_rt_valid]
             # Disjoint-element scatters — no barrier (a freed v has no live reader;
             # per-element scatter writes are atomic).
             # `index_fill_`, NOT `t[idx] = -1`: the scalar form makes torch
