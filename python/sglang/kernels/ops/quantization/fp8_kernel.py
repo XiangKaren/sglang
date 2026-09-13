@@ -125,7 +125,15 @@ if is_fp8_fnuz():
     fp8_dtype = torch.float8_e4m3fnuz
     fp8_max = 224.0
 else:
-    fp8_dtype = torch.float8_e4m3fn
+    # WIRE (perf): honor SGLANG_FP8_DTYPE=e5m2 (orig behavior; the rebase hardcoded
+    # e4m3, a dead no-op). e5m2 is orig's fast decode path — it unblocks the
+    # e5m2-only ESIMD MoE-full fusion (_gather_moe_full_weights gates on e5m2
+    # weights) and the faster e5m2 MoE device kernels. scaled_fp8_quant already has
+    # the e5m2 fallback (native torch quant), since the sgl C++ quant ops emit e4m3.
+    if os.environ.get("SGLANG_FP8_DTYPE", "e4m3").lower() == "e5m2":
+        fp8_dtype = torch.float8_e5m2
+    else:
+        fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 

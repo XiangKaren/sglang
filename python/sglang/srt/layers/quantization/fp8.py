@@ -883,9 +883,10 @@ class Fp8LinearMethod(LinearMethodBase):
             block_n, block_k = None, None
 
         # Create the weight
-        weight_dtype = (
-            torch.float8_e4m3fn if is_checkpoint_fp8_serialized else params_dtype
-        )
+        # WIRE (perf): use fp8_dtype (honors SGLANG_FP8_DTYPE=e5m2) rather than a
+        # hardcoded e4m3fn, matching orig fp8.py:744. Keeps dense fp8 linear weights
+        # on the same format as MoE weights (fp8.py:2373 already uses fp8_dtype).
+        weight_dtype = fp8_dtype if is_checkpoint_fp8_serialized else params_dtype
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition, input_size_per_partition, dtype=weight_dtype
