@@ -61,12 +61,19 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_ph_lf,
     )
 if _is_xpu:
+    # XPU uses the same sgl_kernel.kvcacheio symbols as CUDA/HIP (all present in the
+    # XPU build). Import the FULL set incl. the *_direct variants so both the "kernel"
+    # and "direct" io_backend paths resolve. XPU should run io_backend="direct" (the
+    # "kernel" mamba path is a CUDA-only JIT kernel — see pool_host/mamba.py).
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
+        transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
         transfer_kv_per_layer,
+        transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,

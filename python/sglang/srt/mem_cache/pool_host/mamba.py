@@ -18,11 +18,14 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-if _is_cuda or _is_hip:
+_is_xpu = is_xpu()
+if _is_cuda or _is_hip or _is_xpu:
+    # The *_direct symbols are present in the XPU sgl_kernel build too; they back the
+    # io_backend="direct" mamba transfer path, which XPU must use.
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_direct,
@@ -30,6 +33,8 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
     )
 if _is_cuda or _is_hip:
+    # io_backend="kernel" mamba transfer is a CUDA-only JIT kernel (transfer_mamba.cuh);
+    # it has no XPU implementation, so it is NOT imported on XPU. XPU runs "direct".
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
