@@ -161,6 +161,11 @@ def _get_unique_name(name: str) -> str:
 
 _groups: Dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
 
+# WIRE (perf): when set, XPU all-reduce in eager mode bypasses the
+# inplace_all_reduce custom-op wrapper (needed only for Dynamo/XPU-graph capture)
+# and calls the in-place collective directly. See GroupCoordinator.all_reduce.
+_XPU_EAGER_ALLREDUCE = os.environ.get("SGL_XPU_EAGER_ALLREDUCE", "0") == "1"
+
 
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
@@ -687,6 +692,17 @@ class GroupCoordinator:
             # _all_reduce_in_place, which for XPU falls through to
             # torch.distributed.all_reduce on self.device_group (the same group
             # used by xpu_communicator).
+            #
+            # WIRE (perf): the custom-op wrapper exists ONLY to protect Dynamo
+            # tracing / XPU graph capture. In pure-eager decode (SGL_XPU_ENABLE_GRAPH=0
+            # + --disable-cuda-graph + TORCH_COMPILE_DISABLE=1) it is ~350us/call of
+            # functionalization/dispatch overhead for nothing — the single biggest
+            # host-side gap vs the orig build (which calls dist.all_reduce directly).
+            # Bypass straight to the in-place collective when eager and not compiling.
+            # Compile/capture path is preserved (falls through to the wrapper below).
+            if _XPU_EAGER_ALLREDUCE and not torch.compiler.is_compiling():
+                self._all_reduce_in_place(input_)
+                return input_
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
