@@ -57,25 +57,6 @@ logger = logging.getLogger(__name__)
 # so enabling it there would be an untested behaviour change. Tracked as a TODO.
 _RECORD_STREAM_DEVICES = ("cuda", "xpu")
 
-# DIAGNOSTIC ONLY (added 2026-08-18 to bisect the BMG DEVICE_LOST hang).
-# Setting SGLANG_HICACHE_RECORD_STREAM=0 drops "xpu" from the tuple above, restoring
-# upstream's `.is_cuda` behaviour on XPU. That is NOT a fix: it reinstates the latent
-# use-after-free this guard exists to prevent (the caching allocator may recycle
-# host_indices/device_indices while the async copy on write_stream is still reading
-# them -> rare, load-dependent KV corruption instead of a hang). It exists so the hang
-# can be attributed with a flag instead of an edit, and so a clean run and a crashing
-# run come from the SAME build.
-if os.environ.get("SGLANG_HICACHE_RECORD_STREAM", "1") == "0":
-    _RECORD_STREAM_DEVICES = tuple(
-        d for d in _RECORD_STREAM_DEVICES if d != "xpu"
-    )
-    logger.warning(
-        "SGLANG_HICACHE_RECORD_STREAM=0: record_stream DISABLED on XPU for the "
-        "HiCache write/load streams. Diagnostic only -- reintroduces a latent "
-        "use-after-free on the KV copy path. Do not run this configuration for "
-        "correctness or performance results."
-    )
-
 device_module = get_device_module()
 
 
@@ -695,6 +676,15 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+
+        # KV geometry for the storage key. Read from the device pool rather than
+        # ServerArgs, because that is the dtype actually in use after "auto" has been
+        # resolved against the model. Stays None when the pool exposes no dtype:
+        # str(None) is the string "None", which passes HiCacheFile's `is not None` check
+        # and would append a meaningless "_dtNone" to every key instead of omitting the
+        # field as intended.
+        device_kv_dtype = getattr(self.mem_pool_device, "dtype", None)
+        kv_cache_dtype = None if device_kv_dtype is None else str(device_kv_dtype)
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,

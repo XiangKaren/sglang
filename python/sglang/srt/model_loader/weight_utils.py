@@ -26,6 +26,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -1201,41 +1202,68 @@ def gguf_quant_weights_iterator(
 
     reader = gguf.GGUFReader(gguf_file)
 
-    # MoE expert weight name patterns
+    # MoE expert weight name patterns. A tuple value means the GGUF tensor packs
+    # several projections along dim 1 and must be split in order (gemma-4 ships a
+    # single ffn_gate_up_exps [E, 2*I, H] with gate first, up second).
     MOE_WEIGHT_PATTERNS = {
+        "ffn_gate_up_exps": ("gate_proj", "up_proj"),
         "ffn_gate_exps": "gate_proj",  # gate projection
         "ffn_up_exps": "up_proj",  # up projection
         "ffn_down_exps": "down_proj",  # down projection
     }
+
+    def _moe_match(tensor_name):
+        """(layer_id, [hf_proj_names], expert_prefix) for a packed MoE tensor.
+
+        Returns None for anything that is not a per-expert weight, notably the
+        `.scale` companions of ffn_*_exps: a plain substring test treats those as
+        MoE tensors, and the old code then dropped them on the floor because the
+        regex demands a `.weight` suffix. Falling through to the normal map
+        lookup keeps them.
+        """
+        m = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight$", tensor_name)
+        if not m:
+            return None
+        hf = MOE_WEIGHT_PATTERNS.get(m.group(2))
+        if hf is None:
+            return None
+        names = list(hf) if isinstance(hf, tuple) else [hf]
+        layer_id = int(m.group(1))
+        # Derive the expert parameter prefix from the name map when it carries
+        # one, so models that do not live under `model.layers.` still work.
+        mapped = gguf_to_hf_name_map.get(tensor_name)
+        prefix = None
+        if mapped:
+            head = mapped.split(".experts.")[0]
+            if head != mapped:
+                prefix = head + ".experts"
+        if prefix is None:
+            prefix = f"model.layers.{layer_id}.mlp.experts"
+        return layer_id, names, prefix
+
+    def _moe_slices(weight, n_parts):
+        """Split the packed [E, n_parts*rows, ...] dim-1 into n_parts views."""
+        if n_parts == 1:
+            return [weight]
+        rows = weight.shape[1] // n_parts
+        return [weight[:, i * rows : (i + 1) * rows] for i in range(n_parts)]
 
     # First pass: yield weight types
     for tensor in reader.tensors:
         weight_type = tensor.tensor_type
         tensor_name = tensor.name
 
-        # Check if this is a MoE expert weight (packed format)
-        is_moe_weight = any(
-            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
-        )
-
-        if is_moe_weight:
-            # MoE weights need special handling - extract layer_id and weight type
-            # Format: blk.{layer_id}.ffn_gate_exps.weight
-            import re
-
-            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
-            if match:
-                layer_id = int(match.group(1))
-                weight_pattern = match.group(2)
-                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
-
-                if hf_weight_name and weight_type.name != "F32":
-                    # Yield weight type for each expert
-                    weight = tensor.data
-                    num_experts = weight.shape[0]
+        moe = _moe_match(tensor_name)
+        if moe is not None:
+            layer_id, hf_names, prefix = moe
+            if weight_type.name != "F32":
+                num_experts = tensor.data.shape[0]
+                for hf_weight_name in hf_names:
                     for expert_id in range(num_experts):
-                        hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight_type"
-                        yield hf_name, torch.tensor(weight_type)
+                        yield (
+                            f"{prefix}.{expert_id}.{hf_weight_name}.qweight_type",
+                            torch.tensor(weight_type),
+                        )
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
@@ -1250,33 +1278,18 @@ def gguf_quant_weights_iterator(
         weight_type = tensor.tensor_type
         tensor_name = tensor.name
 
-        # Check if this is a MoE expert weight (packed format)
-        is_moe_weight = any(
-            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
-        )
-
-        if is_moe_weight:
-            # MoE weights: split packed format into individual expert weights
-            import re
-
-            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
-            if match:
-                layer_id = int(match.group(1))
-                weight_pattern = match.group(2)
-                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
-
-                if hf_weight_name:
-                    # Packed format: [num_experts, ...]
-                    num_experts = weight.shape[0]
-                    for expert_id in range(num_experts):
-                        expert_weight = weight[expert_id]
-
-                        if weight_type.name != "F32":
-                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
-                        else:
-                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
-
-                        yield hf_name, torch.tensor(expert_weight)
+        moe = _moe_match(tensor_name)
+        if moe is not None:
+            layer_id, hf_names, prefix = moe
+            suffix = "weight" if weight_type.name == "F32" else "qweight"
+            parts = _moe_slices(weight, len(hf_names))
+            for hf_weight_name, part in zip(hf_names, parts):
+                num_experts = part.shape[0]
+                for expert_id in range(num_experts):
+                    yield (
+                        f"{prefix}.{expert_id}.{hf_weight_name}.{suffix}",
+                        torch.tensor(part[expert_id]),
+                    )
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
@@ -1285,6 +1298,105 @@ def gguf_quant_weights_iterator(
                 name = name.replace("weight", "qweight")
             param = torch.tensor(weight)
             yield name, param
+
+
+def gguf_mtp_weights_iterator(
+    gguf_file: str,
+    gguf_to_hf_name_map: Dict[str, str],
+    mtp_src_layer: int,
+    dtype: torch.dtype = torch.float16,
+    dense_hf_names: Optional[Set[str]] = None,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Yield the MTP (NextN) layer of a GGUF checkpoint for the draft model.
+
+    The MTP layer is stored fully quantized in the checkpoint (on the 35B-A3B:
+    Q4_K routed gate/up, Q5_K down, Q8_0 attention), exactly like a regular
+    layer. The draft model is built with the same GGUF quant config as the
+    target, so those tensors are handed over as raw ``.qweight`` blocks plus a
+    ``.qweight_type`` scalar -- mirroring :func:`gguf_quant_weights_iterator` --
+    and the quantized kernels run on them directly.
+
+    ``dense_hf_names`` lists the few HF names whose draft module is NOT a
+    quantized layer and therefore needs real values: ``mtp.fc.weight`` maps onto
+    a bare ``nn.Linear``. Those are dequantized to ``dtype`` here. F32 tensors
+    (all the norms) are always passed through as plain ``.weight``.
+
+    ``gguf_to_hf_name_map`` covers the non-expert tensors. The routed experts
+    (``blk.<L>.ffn_{gate,up,down}_exps.weight``) are packed
+    ``[num_experts, ...]`` tensors that have to be split per expert and rebased
+    onto the draft's single layer 0, so they are handled here directly.
+    """
+    import gguf
+    from gguf import dequantize as gguf_dequantize
+
+    dense_hf_names = dense_hf_names or set()
+
+    expert_leaf = {
+        "ffn_gate_exps": "gate_proj",
+        "ffn_up_exps": "up_proj",
+        "ffn_down_exps": "down_proj",
+    }
+    expert_src = {f"blk.{mtp_src_layer}.{k}.weight": v for k, v in expert_leaf.items()}
+
+    def to_dense(data, weight_type) -> torch.Tensor:
+        if weight_type.name == "F32":
+            return torch.tensor(data).to(dtype)
+        return torch.from_numpy(gguf_dequantize(data, weight_type)).to(dtype)
+
+    reader = gguf.GGUFReader(gguf_file)
+
+    # First pass: quant types. The GGUF weight loader records the per-tensor
+    # quant type into a separate param, which must exist before the raw blocks
+    # are delivered, so emit every type up front (as gguf_quant_weights_iterator
+    # does).
+    for tensor in reader.tensors:
+        if tensor.tensor_type.name == "F32":
+            continue
+        leaf = expert_src.get(tensor.name)
+        if leaf is not None:
+            num_experts = tensor.data.shape[0]
+            for expert_id in range(num_experts):
+                yield (
+                    f"mtp.layers.0.mlp.experts.{expert_id}.{leaf}.qweight_type",
+                    torch.tensor(tensor.tensor_type),
+                )
+        elif tensor.name in gguf_to_hf_name_map:
+            hf_name = gguf_to_hf_name_map[tensor.name]
+            if hf_name in dense_hf_names:
+                continue
+            yield hf_name.replace("weight", "qweight_type"), torch.tensor(
+                tensor.tensor_type
+            )
+
+    # Second pass: the tensors themselves.
+    for tensor in reader.tensors:
+        quantized = tensor.tensor_type.name != "F32"
+        leaf = expert_src.get(tensor.name)
+        if leaf is not None:
+            data = tensor.data
+            suffix = "qweight" if quantized else "weight"
+            for expert_id in range(data.shape[0]):
+                yield (
+                    f"mtp.layers.0.mlp.experts.{expert_id}.{leaf}.{suffix}",
+                    torch.tensor(data[expert_id]),
+                )
+        elif tensor.name in gguf_to_hf_name_map:
+            hf_name = gguf_to_hf_name_map[tensor.name]
+            if not quantized:
+                yield hf_name, torch.tensor(tensor.data).to(dtype)
+            elif hf_name in dense_hf_names:
+                # Draft module is not a quantized layer; it needs real values.
+                dense = to_dense(tensor.data, tensor.tensor_type)
+                # GGUF stores the shared-expert gate as a 1-D vector, while the
+                # HF module is a [1, hidden] Linear.
+                if (
+                    hf_name.endswith("mlp.shared_expert_gate.weight")
+                    and dense.dim() == 1
+                ):
+                    dense = dense.unsqueeze(0)
+                yield hf_name, dense
+            else:
+                yield hf_name.replace("weight", "qweight"), torch.tensor(tensor.data)
 
 
 def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:

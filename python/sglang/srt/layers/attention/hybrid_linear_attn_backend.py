@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional, Union
 
 import torch
@@ -24,7 +25,6 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
-
 
 # Kernel to track mamba states if needed based on track mask
 @triton.jit
@@ -155,41 +155,34 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
-        import os
-        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
-        if _debug:
-            print(f"[DEFERRED_COW_CLEAR] enter: mode={forward_batch.forward_mode}, is_draft={self.is_draft_worker}", flush=True)
-        if not forward_batch.forward_mode.is_extend() or self.is_draft_worker:
-            if _debug:
-                print(f"[DEFERRED_COW_CLEAR] early return (not extend or draft)", flush=True)
+        # TARGET_VERIFY is an "extend" mode, but the deferred clear/COW must only
+        # run once, ahead of the prefill that initialises the state. The owning
+        # ScheduleBatch keeps its mamba_clear_indices after that prefill (only the
+        # per-forward copy is reset), so without this guard every verify step
+        # would replay the clear and wipe the mamba state the prefill just wrote.
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or self.is_draft_worker
+        ):
             return
         if (
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0
         ):
-            if _debug:
-                print(f"[DEFERRED_COW_CLEAR] clearing {len(forward_batch.mamba_clear_indices)} slots: {forward_batch.mamba_clear_indices.tolist()[:10]}...", flush=True)
             self.req_to_token_pool.mamba_pool.clear_slots(
                 forward_batch.mamba_clear_indices
             )
-            if _debug:
-                print(f"[DEFERRED_COW_CLEAR] clear_slots done", flush=True)
         if (
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
-            if _debug:
-                print(f"[DEFERRED_COW_CLEAR] COW: {len(forward_batch.mamba_cow_src_indices)} copies, src={forward_batch.mamba_cow_src_indices.tolist()[:10]}, dst={forward_batch.mamba_cow_dst_indices.tolist()[:10]}", flush=True)
             self.req_to_token_pool.mamba_pool.copy_from(
                 forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
             )
-            if _debug:
-                print(f"[DEFERRED_COW_CLEAR] copy_from done", flush=True)
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
-        if _debug:
-            print(f"[DEFERRED_COW_CLEAR] exit", flush=True)
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         import os
@@ -468,6 +461,34 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
+        # Bounds guard. Everything here is already on CPU, so this costs no
+        # device sync. `h` has one row per chunk per sequence; an index past
+        # the end would be an out-of-bounds *device* read in
+        # `_track_mamba_state_extend`, which shows up as a GPU page fault
+        # (UR_RESULT_ERROR_DEVICE_LOST) at the next synchronisation point
+        # rather than as a Python IndexError.
+        if track_ssm_h_src.numel() > 0:
+            total_h_rows = int(num_h_states.sum())
+            bad = (track_ssm_h_src < 0) | (track_ssm_h_src >= total_h_rows)
+            if bool(bad.any()):
+                logger.error(
+                    "Mamba extend tracking: %d/%d h index(es) out of range "
+                    "[0, %d); clamping. extend_seq_lens=%s prefix_lens=%s "
+                    "mamba_track_seqlens=%s mamba_track_mask=%s "
+                    "lens_to_track=%s offsets=%s src=%s",
+                    int(bad.sum()),
+                    track_ssm_h_src.numel(),
+                    total_h_rows,
+                    extend_seq_lens.tolist(),
+                    prefix_lens.tolist(),
+                    mamba_track_seqlens.tolist(),
+                    mamba_track_mask.tolist(),
+                    lens_to_track.tolist(),
+                    track_ssm_src_offset.tolist(),
+                    track_ssm_h_src.tolist(),
+                )
+                track_ssm_h_src = track_ssm_h_src.clamp(0, total_h_rows - 1)
+
         # Move back to GPU
         return (
             track_ssm_h_src.to(self.device, non_blocking=True),
@@ -700,10 +721,23 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.batch_size,
             )
 
+    def _warn_missing_intermediate_states(self, n_rows: int):
+        """Warn once when the kernel gave us no per-chunk states to snapshot."""
+        if not getattr(self, "_warned_missing_h", False):
+            self._warned_missing_h = True
+            logger.warning(
+                "Mamba extend tracking: kernel returned no intermediate chunk "
+                "states, so %d unaligned snapshot row(s) per batch cannot be "
+                "written. Prefix-cached prefills that resume from those "
+                "snapshots will restore a stale SSM state. Aligned snapshots "
+                "are unaffected.",
+                n_rows,
+            )
+
     def _track_mamba_state_extend(
         self,
         forward_batch: ForwardBatch,
-        h: torch.Tensor,
+        h: Optional[torch.Tensor],
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
     ):
@@ -716,16 +750,25 @@ class MambaAttnBackendBase(AttentionBackend):
         to the chunk size. See `_init_track_ssm_indices` for more details on how
         the source and destination indices are computed.
 
+        ``h`` (the per-chunk intermediate states) may be None when the kernel
+        backend does not produce them. Only the *unaligned* branch needs it; the
+        aligned branch copies the final state out of ``ssm_states`` and must
+        still run, otherwise the snapshot inserted into the radix cache keeps a
+        stale SSM state while its conv state is fresh.
+
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
         if forward_metadata.has_mamba_track_mask:
-            h = h.squeeze(0)
-
-            if forward_metadata.track_ssm_h_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
+            n_h = forward_metadata.track_ssm_h_src.numel()
+            if n_h > 0:
+                if h is None:
+                    self._warn_missing_intermediate_states(n_h)
+                else:
+                    h = h.squeeze(0)
+                    ssm_states[forward_metadata.track_ssm_h_dst] = h[
+                        forward_metadata.track_ssm_h_src
+                    ].to(ssm_states.dtype, copy=False)
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src

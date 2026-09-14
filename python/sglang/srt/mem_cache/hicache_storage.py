@@ -347,9 +347,11 @@ class HiCacheFile(HiCacheStorage):
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
 
-        # KV geometry: see the note on HiCacheStorageConfig. Appended only when known,
-        # so keys written by a server that predates this stay readable rather than being
-        # silently orphaned by a bare "_None" suffix.
+        # KV geometry: see the note on HiCacheStorageConfig. Appended only when known, so
+        # a caller that cannot report the geometry keys on the fields it does know rather
+        # than on the literal string "None". Note that once a caller DOES report them the
+        # keys change, so an L3 directory written before this lands is not readable by a
+        # server after it -- that is a one-off cold cache, not a corrupted read.
         if storage_config.kv_cache_dtype is not None:
             self.config_suffix += f"_dt{storage_config.kv_cache_dtype}"
         if storage_config.page_size is not None:

@@ -33,7 +33,11 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5ForCausalLM,
+    _get_shared_embed_weight,
+    _set_shared_embed_weight,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -121,15 +125,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         )
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        return (
+            _get_shared_embed_weight(self.model.embed_tokens),
+            _get_shared_embed_weight(self.lm_head),
+        )
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
+        _set_shared_embed_weight(self.model.embed_tokens, embed)
         if not self.config.tie_word_embeddings:
-            del self.lm_head.weight
-
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+            _set_shared_embed_weight(self.lm_head, head)
+        else:
+            self.lm_head = self.model.embed_tokens
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -265,6 +271,26 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        # GGUF stores GemmaRMSNorm weights with the +1 already folded in (the
+        # checkpoint value is standard_weight + 1), but GemmaRMSNorm computes
+        # x*(1+w), so the param must hold (stored - 1). Qwen3_5ForCausalLM does
+        # this for the main branch, but it skips every "mtp" name (they are
+        # routed here), so the MTP branch has to redo it. The MTP layer is a
+        # full-attention layer, so no GDN linear_attn.norm (plain RMSNormGated,
+        # no offset) can show up in this list.
+        _is_gguf = (
+            getattr(self, "quant_config", None) is not None
+            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
+        )
+        _gemma_norm_suffixes = (
+            "pre_fc_norm_embedding.weight",
+            "pre_fc_norm_hidden.weight",
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        )
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -272,6 +298,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             # Only process MTP branch weights
             if "mtp" not in name:
                 continue
+
+            if _is_gguf and (
+                name.endswith(_gemma_norm_suffixes) or name == "mtp.norm.weight"
+            ):
+                loaded_weight = loaded_weight - 1.0
 
             if name.startswith("mtp."):
                 # Remove the mtp. prefix for processing

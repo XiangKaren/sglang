@@ -1,10 +1,15 @@
+import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
+    TritonGDNKernel,
+    _as_i32,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
@@ -18,6 +23,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
@@ -410,23 +416,103 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
+            # XPU fast path: the triton causal_conv1d_update is numerically
+            # broken on triton-XPU (same root cause as the GDN recurrence), so
+            # route the verify-step conv to the ESIMD port. It reads history
+            # from conv_state, writes the per-step rollback windows into
+            # intermediate_conv_window, and leaves the main conv_state pool
+            # untouched (mamba_state_scatter commits it) -- same contract as the
+            # triton call below. topk=1 (linear chain) only, hence no
+            # retrieve_next_token/sibling/parent tree walk.
+            _use_esimd_verify_conv = (
+                is_xpu()
+                and os.environ.get("SGL_XPU_GDN_VERIFY_ESIMD") == "1"
+                and hasattr(torch.ops, "eagle_ops")
+                and hasattr(torch.ops.eagle_ops, "causal_conv1d_verify")
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            # The triton conv wants channel-major [B, D, N], which forces a
+            # transpose+copy on the way in AND another one on the way out (the
+            # downstream GDN kernel and the q/k/v split both need token-major).
+            # That was 2 real copies per GDN layer, 60 per forward on a 30-layer
+            # model. causal_conv1d_verify_tm is the same kernel addressed
+            # token-major, so [B, N, D] flows straight through as views.
+            _use_tm_conv = _use_esimd_verify_conv and hasattr(
+                torch.ops.eagle_ops, "causal_conv1d_verify_tm"
+            )
+            if _use_tm_conv:
+                # mixed_qkv is [seq_len, D] row-dense but possibly a column
+                # slice of the wider in_proj output (row stride > D), so build
+                # the [B, N, D] token-major view with as_strided rather than
+                # .view(), which would reject the strided case. The conv kernel
+                # reads x through its real strides; out is always a fresh
+                # contiguous buffer.
+                row_stride = mixed_qkv.stride(0)
+                mixed_qkv_tm = mixed_qkv.as_strided(
+                    (batch_size, draft_token_num, mixed_qkv.shape[1]),
+                    (draft_token_num * row_stride, row_stride, 1),
+                )
+                mixed_qkv_processed = torch.empty(
+                    mixed_qkv_tm.shape,
+                    dtype=mixed_qkv.dtype,
+                    device=mixed_qkv.device,
+                )
+                torch.ops.eagle_ops.causal_conv1d_verify_tm(
+                    mixed_qkv_processed,
+                    mixed_qkv_tm,
+                    layer.conv_weights,
+                    layer.bias,
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    _as_i32(cache_indices[:batch_size]),
+                    _as_i32(intermediate_state_indices[:batch_size]),
+                    1 if layer.activation == "silu" else 0,
+                )
+                mixed_qkv = mixed_qkv_processed.view(seq_len, -1)
+            else:
+                # reshape (not view): mixed_qkv may be a strided column slice
+                # of the in_proj output, which this legacy path cannot address.
+                mixed_qkv_reshaped = mixed_qkv.reshape(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+                if _use_esimd_verify_conv:
+                    mixed_qkv_reshaped = mixed_qkv_reshaped.contiguous()
+                    mixed_qkv_processed = torch.empty_like(mixed_qkv_reshaped)
+                    torch.ops.eagle_ops.causal_conv1d_verify(
+                        mixed_qkv_processed,
+                        mixed_qkv_reshaped,
+                        layer.conv_weights,
+                        layer.bias,
+                        conv_states,
+                        intermediate_conv_window_cache,
+                        _as_i32(cache_indices[:batch_size]),
+                        _as_i32(intermediate_state_indices[:batch_size]),
+                        1 if layer.activation == "silu" else 0,
+                    )
+                else:
+                    mixed_qkv_processed = causal_conv1d_update(
+                        mixed_qkv_reshaped,
+                        conv_states,
+                        layer.conv_weights,
+                        layer.bias,
+                        layer.activation,
+                        conv_state_indices=cache_indices[:batch_size],
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        intermediate_state_indices=intermediate_state_indices[
+                            :batch_size
+                        ],
+                        retrieve_next_token=retrieve_next_token,
+                        retrieve_next_sibling=retrieve_next_sibling,
+                        retrieve_parent_token=retrieve_parent_token,
+                    )
+                # The ESIMD conv writes a contiguous [B, D, N] buffer, so the
+                # transpose below yields a token-innermost (channel-major) view.
+                # Normalise it back to the standard token-major layout that the
+                # triton path produces, otherwise every downstream consumer sees
+                # dense-but-permuted q/k/v and has to copy (or, worse, silently
+                # inherits those strides through empty_like).
+                mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(seq_len, -1)
+                if _use_esimd_verify_conv:
+                    mixed_qkv = mixed_qkv.contiguous()
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -487,9 +573,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
+                # q/k/v above are strided views into mixed_qkv (torch.split on
+                # the last dim), so any kernel that wants them contiguous pays
+                # 3 real copies per layer. Hand the packed buffer over as well
+                # so the ESIMD path can index it in place instead.
+                packed_qkv=mixed_qkv,
+                num_k_heads=layer.num_k_heads,
+                head_k_dim=layer.head_k_dim,
+                num_v_heads=layer.num_v_heads,
+                head_v_dim=layer.head_v_dim,
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            # Per-chunk intermediate states are only needed when this batch has
+            # to snapshot at a position that is not chunk-aligned; asking for
+            # them unconditionally would materialise a large tensor per layer.
+            need_h = (
+                forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_h_src.numel() > 0
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -499,6 +601,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                intermediate_chunk_size=(
+                    get_global_server_args().mamba_cache_chunk_size if need_h else 0
+                ),
             )
 
             if (
@@ -509,9 +614,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            if h is not None:
-                self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
-                )
+
+            # `h` may be None: some kernel backends (XPU) do not emit the
+            # per-chunk intermediate states. Only the unaligned branch of the
+            # tracking needs them, so the call must not be gated on `h` -- doing
+            # so silently dropped *every* extend-time SSM snapshot on XPU.
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, forward_metadata
+            )
 
         return core_attn_out
