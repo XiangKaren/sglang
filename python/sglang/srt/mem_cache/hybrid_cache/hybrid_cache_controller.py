@@ -489,11 +489,13 @@ class HybridCacheController(BaseHiCacheController):
     def start_loading(self) -> int:
         if not self.load_queue:
             return -1
+        _hicache_debug(f"start_loading: queue_len={len(self.load_queue)}")
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
         )
+        _hicache_debug(f"start_loading: host={host_indices.shape}, device={device_indices.shape}, extra_pools={len(resolved_pool_transfers) if resolved_pool_transfers else 0}")
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -509,12 +511,23 @@ class HybridCacheController(BaseHiCacheController):
                     pool_transfers=resolved_pool_transfers,
                 )
                 producer_event.complete(i)
+            # XPU: drain load_stream before releasing the index tensors, exactly
+            # as start_writing drains write_stream. record_stream() is the
+            # portable protection, but for the large Mamba H->D copies we mirror
+            # the write path's explicit sync so the async copies are guaranteed
+            # complete before the Mamba slot index can be recycled by the
+            # allocator (recycle-mid-copy -> lost semaphore -> DEVICE_LOST).
+            if str(device_module).find("xpu") >= 0:
+                _hicache_debug("start_loading: XPU - draining load_stream after H->D copies")
+                self.load_stream.synchronize()
+                _hicache_debug("start_loading: XPU - load_stream sync done")
             self._record_transfer_indices_on_stream(
                 self.load_stream,
                 host_indices,
                 device_indices,
                 resolved_pool_transfers,
             )
+        _hicache_debug("start_loading: done")
         self.ack_load_queue.append(
             HiCacheAck(
                 producer_event.start_event,
@@ -524,6 +537,13 @@ class HybridCacheController(BaseHiCacheController):
         )
         return producer_id
 
+    # Caching allocators on these device types require record_stream() so an
+    # index tensor is not recycled while an async copy on `stream` is still
+    # reading it. `.is_cuda` is False on XPU, so the old guard silently skipped
+    # XPU and let the allocator recycle the Mamba/KV index tensors mid H->D copy
+    # -> lost semaphore -> UR_RESULT_ERROR_DEVICE_LOST. Match on device.type.
+    _RECORD_STREAM_DEVICES = ("cuda", "xpu")
+
     def _record_transfer_indices_on_stream(
         self,
         stream: torch.Stream,
@@ -531,15 +551,15 @@ class HybridCacheController(BaseHiCacheController):
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ) -> None:
-        if host_indices.is_cuda:
-            host_indices.record_stream(stream)
-        if device_indices.is_cuda:
-            device_indices.record_stream(stream)
+        def _record(t: Optional[torch.Tensor]) -> None:
+            if t is not None and t.device.type in self._RECORD_STREAM_DEVICES:
+                t.record_stream(stream)
+
+        _record(host_indices)
+        _record(device_indices)
         for transfer in pool_transfers or []:
-            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
-                transfer.host_indices.record_stream(stream)
-            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
-                transfer.device_indices.record_stream(stream)
+            _record(transfer.host_indices)
+            _record(transfer.device_indices)
 
     def prefetch(
         self,
