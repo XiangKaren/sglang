@@ -2471,17 +2471,64 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def check_hicache_events(self) -> None:
-        """Called per scheduler step to poll async HiCache events."""
+        """Called per scheduler step to poll async HiCache events.
+
+        Optimized to batch write and load completion checks into a single
+        all_reduce call to reduce per-step synchronization overhead.
+        """
         import os
         _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
         if _debug:
             print("[CHECK_HICACHE_EVENTS] enter", flush=True)
-        self.writing_check()
+
+        cc = self.cache_controller
+        if cc is not None:
+            # Count completions locally for both write and load
+            write_finish_count = 0
+            load_finish_count = 0
+
+            if self.pp_rank == 0:
+                for _, finish_event, _ in cc.ack_write_queue:
+                    if not finish_event.query():
+                        break
+                    write_finish_count += 1
+
+                for _, finish_event, _ in cc.ack_load_queue:
+                    if not finish_event.query():
+                        break
+                    load_finish_count += 1
+
+            # Single all_reduce for both counts (halves sync overhead)
+            counts_tensor = torch.tensor(
+                [write_finish_count, load_finish_count], dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(counts_tensor, torch.distributed.ReduceOp.MIN)
+            write_finish_count = counts_tensor[0].item()
+            load_finish_count = counts_tensor[1].item()
+
+            if _debug:
+                print(f"[CHECK_HICACHE_EVENTS] batched all_reduce: write={write_finish_count}, load={load_finish_count}", flush=True)
+
+            # Process write completions
+            while write_finish_count > 0:
+                _, finish_event, ack_list = cc.ack_write_queue.pop(0)
+                finish_event.synchronize()
+                for ack_id in ack_list:
+                    self._finish_write_through_ack(ack_id)
+                write_finish_count -= 1
+
+            # Process load completions
+            while load_finish_count > 0:
+                _, finish_event, ack_list = cc.ack_load_queue.pop(0)
+                finish_event.synchronize()
+                for ack_id in ack_list:
+                    node, lock_params = self.ongoing_load_back.pop(ack_id)
+                    self.dec_lock_ref(node, lock_params)
+                load_finish_count -= 1
+
         if _debug:
-            print("[CHECK_HICACHE_EVENTS] writing_check done", flush=True)
-        self.loading_check()
-        if _debug:
-            print("[CHECK_HICACHE_EVENTS] loading_check done", flush=True)
+            print("[CHECK_HICACHE_EVENTS] sync done", flush=True)
+
         if self.enable_storage:
             self.drain_storage_control_queues()
         self._reap_completed_async_work()
