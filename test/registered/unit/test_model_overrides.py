@@ -3210,6 +3210,19 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"]),
             )
         )
+        # intel_xpu keeps the extra buffer (and overlap scheduling) too
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "Qwen3_5MoeForConditionalGeneration",
+                    linear_attn_backend="intel_xpu",
+                )
+            ),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
 
     def test_mamba_radix_cache_resolution_reads_registry_specs(self):
         """A spec registered by config predicate (archs=[]) drives the leaves

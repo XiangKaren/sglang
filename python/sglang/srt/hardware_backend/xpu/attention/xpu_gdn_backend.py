@@ -39,8 +39,9 @@ class XpuGDNAttnBackend(GDNAttnBackend):
         if mode.is_target_verify() or mode.is_draft_extend_v2():
             return False
         fm = self.forward_metadata
-        if getattr(fm, "has_mamba_track_mask", False):
-            # chunked prefix-cache intermediate-state tracking unsupported
+        if not mode.is_decode_or_idle() and getattr(fm, "has_mamba_track_mask", False):
+            # chunked prefix-cache intermediate-state tracking unsupported; decode
+            # tracking is a copy after the step (see forward_fused_gdn)
             return False
         if getattr(fm, "query_start_loc", None) is None:
             return False
@@ -135,4 +136,10 @@ class XpuGDNAttnBackend(GDNAttnBackend):
         )
 
         # conv/ssm states were updated in place via the pool views.
+        if forward_batch.forward_mode.is_decode_or_idle():
+            # Copy the new states to the prefix-cache track slots, as the Triton
+            # decode path does. Masked on device, so it also runs in decode graphs.
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            )
         return core_attn_out, z

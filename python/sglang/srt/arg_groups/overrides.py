@@ -444,7 +444,9 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
     ):
-        return view.linear_attn_backend == "triton"
+        # intel_xpu runs its fused SYCL kernel only on steps without Mamba state
+        # tracking (XpuGDNAttnBackend.supports_fused_gdn) and Triton on the rest.
+        return view.linear_attn_backend in ("triton", "intel_xpu")
     return False
 
 
