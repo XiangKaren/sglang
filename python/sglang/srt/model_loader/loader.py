@@ -333,6 +333,41 @@ def _modules_with_quant_method(model: nn.Module):
             yield module, quant_method
 
 
+def _move_modules_and_postprocess(
+    model: nn.Module, target_device: torch.device
+) -> None:
+    """Move modules to ``target_device`` one at a time, each followed by its
+    ``process_weights_after_loading``, then rebuild views of moved parameters."""
+    quant_methods = {
+        id(module): quant_method
+        for module, quant_method in _modules_with_quant_method(model)
+    }
+    # Children before parents, so a module's subtree is on the device when its
+    # own post-load processing runs.
+    for module in reversed(list(model.modules())):
+        for param in module.parameters(recurse=False):
+            param.data = param.data.to(target_device)
+        for name, buffer in module.named_buffers(recurse=False):
+            if buffer is not None:
+                module._buffers[name] = buffer.to(target_device)
+        quant_method = quant_methods.get(id(module))
+        if quant_method is not None:
+            quant_method.process_weights_after_loading(module)
+    # Views of moved parameters (e.g. linear-attention conv weights) still point
+    # at host storage; rebuild them from the device parameters.
+    PreshardedModelLoader._rebind_parameter_aliases(model)
+
+
+def _host_tensor_attributes(model: nn.Module) -> List[str]:
+    """Tensors held as plain attributes (not parameters or buffers) on the host."""
+    return [
+        f"{module_name}.{attr}" if module_name else attr
+        for module_name, module in model.named_modules()
+        for attr, value in vars(module).items()
+        if isinstance(value, torch.Tensor) and value.device.type == "cpu"
+    ]
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -1118,6 +1153,12 @@ class LayeredModelLoader(DefaultModelLoader):
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
+        model_class, _ = get_model_architecture(model_config)
+        if not hasattr(model_class, "load_weights_to_module"):
+            return self._load_model_staged_on_host(
+                model_config, target_device, quant_config
+            )
+
         with set_default_torch_dtype(model_config.dtype):
             # Create model on meta device
             with torch.device("meta"):
@@ -1159,6 +1200,41 @@ class LayeredModelLoader(DefaultModelLoader):
             # Start calling on root module
             fill_module(model, [], weights)
 
+        return model.eval()
+
+    def _load_model_staged_on_host(
+        self,
+        model_config: ModelConfig,
+        target_device: torch.device,
+        quant_config: Optional[QuantizationConfig],
+    ) -> nn.Module:
+        """Layered loading for models without ``load_weights_to_module``.
+
+        The model is built and the checkpoint loaded in host memory. Modules are
+        then moved to the device one at a time, each followed by its
+        ``process_weights_after_loading`` (e.g. online quantization), so the device
+        holds the processed weights plus at most one module's original weights,
+        never the whole unprocessed model. Host memory must hold the checkpoint.
+        The post-load order matches ``DefaultModelLoader``.
+        """
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device("cpu"):
+                model = _initialize_model(model_config, self.load_config, quant_config)
+            DefaultModelLoader.load_weights_only(
+                model, self._get_all_weights(model_config, model), target_device
+            )
+
+            _move_modules_and_postprocess(model, target_device)
+
+        stale = _host_tensor_attributes(model)
+        if stale and target_device.type != "cpu":
+            raise ValueError(
+                "--load-format layered left tensors that are not parameters or "
+                f"buffers on the host: {stale[:8]}. {model_config.model_path} does "
+                "not support layered loading yet."
+            )
+
+        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
 

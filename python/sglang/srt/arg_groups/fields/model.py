@@ -78,7 +78,8 @@ class Model(msgspec.Struct):
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller."
+            "smaller. Models without a layer-wise loader are loaded into host "
+            "memory first and then moved to the device one module at a time."
             '"presharded" performs a normal first-time load (with quantization), '
             "then dumps a per-rank/per-tensor sharded checkpoint with content "
             "deduplication into "
